@@ -1,0 +1,1256 @@
+#pragma once
+
+#include "VoicedColourProcessor.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+// Live-only TD-PSOLA research renderer.  It never reads future input.  The
+// reported latency leaves enough history for a *centred* analysis grain to be
+// complete before that grain is written to the future output FIFO.
+class CausalTDPSOLARenderer
+{
+public:
+    // Offline forensic switchboard. Defaults preserve the production signal
+    // path exactly; the WAV bench can disable one renderer layer at a time
+    // without touching target selection or control timing.
+    struct DiagnosticAblation
+    {
+        bool periodicResidual = true;
+        bool correctionWindowBlend = true;
+        bool waveformAnchoredSourceMarks = false;
+        // The production path uses the phase-continuous renderer. Offline
+        // A/B can select this retained TD-PSOLA path explicitly for handoff
+        // regression measurements.
+        bool phaseContinuousRenderer = true;
+        // Offline isolation: retain the production phase renderer but remove
+        // its frequency map. This separates resynthesis coloration from
+        // note/ratio automation without changing tracker state.
+        bool phaseForceUnityRatio = false;
+        bool phaseForceStaticUpRatio = false;
+    };
+
+    void setDiagnosticAblation (DiagnosticAblation value) noexcept { diagnosticAblation = value; }
+    void setVoicedColourAmountPercent (float newAmountPercent) noexcept
+    {
+        voicedColourAmountPercent = std::clamp (newAmountPercent, 0.0f, 100.0f);
+    }
+
+    struct SourceMark { uint64_t sample = 0; double period = 0.0; };
+    struct ScheduledGrain
+    {
+        SourceMark sourceMark {};
+        uint64_t synthesisMark = 0;
+        double ratioAtStart = 1.0;
+        double fractionalPhaseOffset = 0.0;
+        int halfWindow = 0;
+        bool active = false;
+    };
+    struct PitchMarkEvidence { double offsetSamples = 0.0; double periodicCorrelation = 0.0; };
+    struct DiagnosticState
+    {
+        enum CorrectionSource : uint8_t
+        {
+            normalDesired = 0,
+            invalidControl,
+            dryGuard
+        };
+
+        // These expose the hand-off at the renderer boundary.  A dry guard
+        // mutes wet output but deliberately does not freeze the source-time
+        // control used to keep the PSOLA lattice current for re-entry.
+        double rendererPreGuardCorrectionCents = 0.0;
+        double rendererPostGuardCorrectionCents = 0.0;
+        double rendererInputCorrectionCents = 0.0;
+        double requestedRatio = 1.0;
+        double activeRatio = 1.0;
+        double sourcePhase = 0.0;
+        double synthesisPhase = 0.0;
+        double currentOverlapWeight = 0.0;
+        double audibleRatioAtStart = 1.0;
+        double audibleGrainAge = 0.0;
+        double audibleReadPosition = 0.0;
+        double audibleSourceMarkTime = -1.0;
+        double audibleSourceMarkF0 = 0.0;
+        double audibleExpectedGrainF0 = 0.0;
+        // Strongest individual OLA contributor at the rendered sample.  This
+        // is forensic-only ownership data; it never feeds synthesis.
+        double dominantGrainWeight = 0.0;
+        double dominantGrainEpoch = -1.0;
+        double dominantGrainRatio = 1.0;
+        double dominantGrainExpectedF0 = 0.0;
+        int dominantGrainTargetMidi = -1;
+        double dominantGrainTargetEventId = -1.0;
+        double dominantGrainTargetControlTimestamp = -1.0;
+        double targetCandidateWeight = 0.0;
+        double targetCandidateEpoch = -1.0;
+        double targetCandidateExpectedF0 = 0.0;
+        double nextEpochBeforeReversal = -1.0;
+        double nextEpochAfterReversal = -1.0;
+        double actualSpawnEpoch = -1.0;
+        double ratioAtSpawn = 1.0;
+        int targetMidiAtSpawn = -1;
+        double targetEventIdAtSpawn = -1.0;
+        double targetControlTimestampAtSpawn = -1.0;
+        double sourcePeriodAtSpawn = 0.0;
+        double expectedOutputPeriod = 0.0;
+        double previousSynthMark = -1.0;
+        double currentSynthMark = -1.0;
+        double actualSynthPeriod = 0.0;
+        double expectedSynthPeriodError = 0.0;
+        double actualSourceMarkSpacing = 0.0;
+        double sourceSelectionCursor = -1.0;
+        double newestCompleteSourceMark = -1.0;
+        // Amount of only the non-periodic high-frequency residual restored
+        // from the latency-aligned dry signal.  This is deliberately not a
+        // global high-band dry mix: vowels should remain entirely wet.
+        double sibilanceResidualMix = 0.0;
+        double highFrequencyEvidence = 0.0;
+        double periodicCoherence = 0.0;
+        double pitchMarkCandidateOffset = 0.0;
+        double pitchMarkCandidateCorrelation = 0.0;
+        double confirmedPitchMarkOffset = 0.0;
+        int confirmedPitchMarkRun = 0;
+        int queuedMarks = 0;
+        int scheduledFutureGrains = 0;
+        int shadowFutureSegments = 0;
+        int shadowAudibleSegments = 0;
+        double shadowFutureSamples = 0.0;
+        bool shadowReplacementEligible = false;
+        double shadowReplacementFirstSample = -1.0;
+        double shadowReplacementLastSample = -1.0;
+        bool shadowCandidateRenderApplied = false;
+        double wetMix = 0.0;
+        CorrectionSource correctionSource = invalidControl;
+        bool latticeReset = false;
+        bool dryGuardActive = false;
+        bool reentryHoldActive = false;
+        bool artifactDryVeto = false;
+        bool grainStarved = false;
+        bool shouldRenderWet = false;
+        int remainingSafetyDrySamples = 0;
+    };
+
+    const DiagnosticState& getDiagnosticState() const noexcept { return diagnosticState; }
+
+    void prepare (double newSampleRate, int newMaximumBlock, int newLatencySamples = 256)
+    {
+        sampleRate = newSampleRate;
+        maximumBlock = newMaximumBlock;
+        latency = std::max (1, newLatencySamples);
+        ringLength = std::max (16384, latency * 8 + maximumBlock * 8);
+        input.assign (static_cast<size_t> (ringLength), 0.0f);
+        outputSum.assign (static_cast<size_t> (ringLength), 0.0f);
+        outputWeight.assign (static_cast<size_t> (ringLength), 0.0f);
+        outputRatioSum.assign (static_cast<size_t> (ringLength), 0.0);
+        outputAgeSum.assign (static_cast<size_t> (ringLength), 0.0);
+        outputReadPositionSum.assign (static_cast<size_t> (ringLength), 0.0);
+        outputSourceMarkSum.assign (static_cast<size_t> (ringLength), 0.0);
+        outputSourceF0Sum.assign (static_cast<size_t> (ringLength), 0.0);
+        outputExpectedF0Sum.assign (static_cast<size_t> (ringLength), 0.0);
+        outputDominantWeight.assign (static_cast<size_t> (ringLength), 0.0f);
+        outputDominantEpoch.assign (static_cast<size_t> (ringLength), -1.0);
+        outputDominantRatio.assign (static_cast<size_t> (ringLength), 1.0);
+        outputDominantExpectedF0.assign (static_cast<size_t> (ringLength), 0.0);
+        outputDominantTargetMidi.assign (static_cast<size_t> (ringLength), -1);
+        outputDominantTargetEventId.assign (static_cast<size_t> (ringLength), -1.0);
+        outputDominantTargetTimestamp.assign (static_cast<size_t> (ringLength), -1.0);
+        marks.assign (2048, {});
+        scheduledGrains.fill ({});
+        scheduledGrainWrite = 0;
+        voicedColour.prepare (sampleRate);
+        reset();
+    }
+
+    void reset() noexcept
+    {
+        std::fill (input.begin(), input.end(), 0.0f);
+        std::fill (outputSum.begin(), outputSum.end(), 0.0f);
+        std::fill (outputWeight.begin(), outputWeight.end(), 0.0f);
+        std::fill (outputRatioSum.begin(), outputRatioSum.end(), 0.0);
+        std::fill (outputAgeSum.begin(), outputAgeSum.end(), 0.0);
+        std::fill (outputReadPositionSum.begin(), outputReadPositionSum.end(), 0.0);
+        std::fill (outputSourceMarkSum.begin(), outputSourceMarkSum.end(), 0.0);
+        std::fill (outputSourceF0Sum.begin(), outputSourceF0Sum.end(), 0.0);
+        std::fill (outputExpectedF0Sum.begin(), outputExpectedF0Sum.end(), 0.0);
+        std::fill (outputDominantWeight.begin(), outputDominantWeight.end(), 0.0f);
+        std::fill (outputDominantEpoch.begin(), outputDominantEpoch.end(), -1.0);
+        std::fill (outputDominantRatio.begin(), outputDominantRatio.end(), 1.0);
+        std::fill (outputDominantExpectedF0.begin(), outputDominantExpectedF0.end(), 0.0);
+        std::fill (outputDominantTargetMidi.begin(), outputDominantTargetMidi.end(), -1);
+        std::fill (outputDominantTargetEventId.begin(), outputDominantTargetEventId.end(), -1.0);
+        std::fill (outputDominantTargetTimestamp.begin(), outputDominantTargetTimestamp.end(), -1.0);
+        absoluteSample = 0;
+        sourcePhase = synthPhase = 0.0;
+        markWrite = markCount = 0;
+        hasPreviousEpoch = false;
+        previousEpoch = {};
+        smoothedRatio = 1.0;
+        wetMix = 0.0;
+        safetyDrySamples = 0;
+        previousControlWasValid = false;
+        previousRequestedCorrectionCents = 0.0;
+        hasPreviousRequestedCorrection = false;
+        hasPreviousOutput = false;
+        previousOutput = 0.0f;
+        lastSpawnEpoch = -1.0;
+        lastSpawnRatio = 1.0;
+        lastSpawnTargetMidi = -1;
+        lastSpawnTargetEventId = -1.0;
+        lastSpawnTargetControlTimestamp = -1.0;
+        hasPreviousCommittedTargetHz = false;
+        hasTargetBeforePreviousHz = false;
+        previousCommittedTargetHz = 0.0;
+        targetBeforePreviousHz = 0.0;
+        previousTargetCommitSample = 0;
+        pendingSynthesisMark = -1.0;
+        previousSynthesisMark = -1.0;
+        previousSourceMarkSample = -1.0;
+        previousSelectedSourceMark = {};
+        hasPreviousSelectedSourceMark = false;
+        previousFractionalPhaseOffset = 0.0;
+        sourceMarkCursor = 0.0;
+        hasSourceMarkCursor = false;
+        hasPreviousExcitationEvidence = false;
+        excitationEvidenceRun = 0;
+        confirmedExcitationOffset = 0.0;
+        hasPendingSourceMark = false;
+        pendingSourceMarkSample = 0;
+        pendingSourceMarkPeriod = 0.0;
+        scheduledGrains.fill ({});
+        scheduledGrainWrite = 0;
+        wetLowState = dryLowState = 0.0;
+        sibilanceResidualMix = 0.0;
+        unvoicedBurstBaselineRms = 0.0;
+        unvoicedBurstGain = 1.0;
+        voicedColour.reset();
+    }
+
+    int latencySamples() const noexcept { return latency; }
+
+    void process (const float* source, float* destination, int samples,
+                  double f0Hz, double requestedRatio, bool voiced, bool forceDry = false,
+                  double committedTargetHz = std::numeric_limits<double>::quiet_NaN()) noexcept
+    {
+        if (source == nullptr || destination == nullptr || samples <= 0 || samples > maximumBlock)
+            return;
+
+        diagnosticState = {};
+        const auto valid = voiced && std::isfinite (f0Hz) && f0Hz >= 140.0 && f0Hz <= 700.0
+                        && std::isfinite (requestedRatio) && requestedRatio >= 0.90 && requestedRatio <= 1.10;
+        if (! valid)
+        {
+            hasSourceMarkCursor = false;
+            hasPreviousSelectedSourceMark = false;
+            previousFractionalPhaseOffset = 0.0;
+            hasPreviousExcitationEvidence = false;
+            excitationEvidenceRun = 0;
+            confirmedExcitationOffset = 0.0;
+            hasPendingSourceMark = false;
+        }
+        // A voiced control following an explicit dry/transient interval must
+        // first populate a fresh grain lattice.  Re-engaging wet immediately
+        // can replay the final grain from the preceding vowel (an audible
+        // held old note then pitch jump).  Keep the latency-aligned dry path
+        // for the calibrated safety interval while the new epochs are made.
+        const auto wasValid = previousControlWasValid;
+        if (valid && ! wasValid)
+            safetyDrySamples = std::max (safetyDrySamples,
+                                         static_cast<int> (std::lround (safetyHoldSeconds * sampleRate)));
+        const auto requestedCorrectionCents = valid
+                                             ? 1200.0 * std::log2 (std::max (requestedRatio, 1.0e-12)) : 0.0;
+        diagnosticState.rendererPreGuardCorrectionCents = requestedCorrectionCents;
+        diagnosticState.rendererPostGuardCorrectionCents = requestedCorrectionCents;
+        diagnosticState.rendererInputCorrectionCents = requestedCorrectionCents;
+        diagnosticState.requestedRatio = requestedRatio;
+        diagnosticState.correctionSource = ! valid ? DiagnosticState::invalidControl
+                                                   : forceDry ? DiagnosticState::dryGuard
+                                                              : DiagnosticState::normalDesired;
+        // A source-time target can legitimately reverse while the previous
+        // PSOLA grains are still queued for the causal output latency. This
+        // is a frequency-control event, never permission to reset the epoch
+        // lattice or either phase accumulator: such a reset teleports the
+        // read/synthesis trajectory and creates an audible click. Ratio
+        // smoothing below carries the reversal into newly scheduled grains
+        // while the existing overlap-add tail remains phase-continuous.
+        const auto rapidCorrectionReversal = valid && hasPreviousRequestedCorrection
+                                          && requestedCorrectionCents * previousRequestedCorrectionCents < 0.0
+                                          && std::abs (requestedCorrectionCents - previousRequestedCorrectionCents)
+                                               >= rapidReversalThresholdCents;
+        const auto strongRatioStep = valid && hasPreviousRequestedCorrection
+                                  && std::abs (requestedCorrectionCents - previousRequestedCorrectionCents)
+                                       >= schedulerTraceThresholdCents;
+        const auto risingCorrectionStep = strongRatioStep
+                                       && requestedCorrectionCents > previousRequestedCorrectionCents;
+        const auto targetIsUsable = valid && std::isfinite (committedTargetHz)
+                                 && committedTargetHz >= 140.0 && committedTargetHz <= 700.0;
+        const auto targetStepCents = targetIsUsable && hasPreviousCommittedTargetHz
+                                   ? std::abs (1200.0 * std::log2 (committedTargetHz / previousCommittedTargetHz))
+                                   : 0.0;
+        const auto targetCommitted = targetStepCents >= 50.0;
+        const auto adjacentTargetCommit = targetCommitted && targetStepCents <= 250.0;
+        if (targetIsUsable)
+        {
+            // A target commit can arrive part-way through the old synthesis
+            // period.  Preserve the phase history, but retime the one
+            // pending epoch to the period of the newly committed neighbour.
+            // This avoids carrying 5–10 ms of the old note into A->B->A
+            // returns without inserting an extra grain or rewriting OLA.
+            const auto returnsToRecentTarget = adjacentTargetCommit && hasTargetBeforePreviousHz
+                                             && std::abs (1200.0 * std::log2 (committedTargetHz
+                                                                              / targetBeforePreviousHz)) < 25.0
+                                             && f0Hz >= rapidReturnMinimumF0Hz
+                                             && absoluteSample - previousTargetCommitSample
+                                                    <= rapidReturnMaximumSamples;
+            if (returnsToRecentTarget && previousSynthesisMark >= 0.0)
+            {
+                const auto firstMarkThisCall = static_cast<double> (absoluteSample + latency);
+                const auto lastMarkThisCall = firstMarkThisCall + static_cast<double> (samples - 1);
+                const auto desiredMark = previousSynthesisMark + sampleRate / committedTargetHz;
+                if (desiredMark >= firstMarkThisCall && desiredMark <= lastMarkThisCall)
+                    pendingSynthesisMark = desiredMark;
+            }
+            if (targetCommitted)
+            {
+                targetBeforePreviousHz = previousCommittedTargetHz;
+                hasTargetBeforePreviousHz = hasPreviousCommittedTargetHz;
+                previousCommittedTargetHz = committedTargetHz;
+                previousTargetCommitSample = absoluteSample;
+            }
+            else if (! hasPreviousCommittedTargetHz)
+            {
+                previousCommittedTargetHz = committedTargetHz;
+                hasPreviousCommittedTargetHz = true;
+            }
+        }
+        else
+        {
+            hasPreviousCommittedTargetHz = false;
+            hasTargetBeforePreviousHz = false;
+            pendingSynthesisMark = -1.0;
+        }
+        const auto synthesisFrequency = targetIsUsable ? committedTargetHz : f0Hz * smoothedRatio;
+        const auto samplesToNextBefore = valid ? (1.0 - synthPhase) * sampleRate / synthesisFrequency : -1.0;
+        if (strongRatioStep)
+        {
+            diagnosticState.nextEpochBeforeReversal = static_cast<double> (absoluteSample) + samplesToNextBefore;
+            diagnosticState.nextEpochAfterReversal = static_cast<double> (absoluteSample)
+                                                   + (1.0 - synthPhase) * sampleRate
+                                                       / (targetIsUsable ? committedTargetHz : f0Hz * requestedRatio);
+        }
+        (void) rapidCorrectionReversal;
+        if (valid)
+        {
+            previousRequestedCorrectionCents = requestedCorrectionCents;
+            hasPreviousRequestedCorrection = true;
+        }
+        else
+        {
+            hasPreviousRequestedCorrection = false;
+        }
+        previousControlWasValid = valid;
+        const auto ratioTarget = valid ? requestedRatio : 1.0;
+        // Hard-tune controls arrive at 128-sample cadence.  A shorter
+        // scheduler-only time constant lets a confirmed target land before
+        // the next vowel transition while still avoiding a period step.
+        // Retune 0 must arrive at the committed ratio within one short
+        // control interval. This smooths frequency only; source/synthesis
+        // phase remains integrated and is never re-anchored on a target
+        // change.
+        constexpr auto ratioSmoothingSeconds = 0.0;
+        const auto ratioAlpha = ratioSmoothingSeconds <= 0.0 ? 1.0
+                              : 1.0 - std::exp (-1.0 / (ratioSmoothingSeconds * sampleRate));
+        const auto mixAlpha = 1.0 - std::exp (-1.0 / (crossfadeSeconds * sampleRate));
+        const auto releaseMixAlpha = 1.0 - std::exp (-1.0 / (releaseCrossfadeSeconds * sampleRate));
+
+        // The residual path needs two modes: non-periodic consonants retain
+        // their dry high band, while a strongly periodic vowel being shifted
+        // by a meaningful amount keeps a *small* amount of its original
+        // high-band texture.  The latter prevents full-wet TD-PSOLA from
+        // making a corrected vowel markedly duller than the source without
+        // turning the signal into a dry/wet double voice.
+        double totalEnergy = 1.0e-12, differenceEnergy = 1.0e-12;
+        double correlation = 0.0, delayedEnergy = 1.0e-12;
+        const auto analysisPeriod = valid ? std::clamp (static_cast<int> (std::lround (sampleRate / f0Hz)), 32, 512) : 0;
+        auto previousAnalysisSample = readInput (static_cast<int64_t> (absoluteSample) - 1);
+        for (int n = 0; n < samples; ++n)
+        {
+            const auto x = static_cast<double> (source[n]);
+            const auto difference = x - previousAnalysisSample;
+            totalEnergy += x * x;
+            differenceEnergy += difference * difference;
+            previousAnalysisSample = source[n];
+            if (analysisPeriod > 0)
+            {
+                const auto delayed = static_cast<double> (n >= analysisPeriod
+                                                               ? source[n - analysisPeriod]
+                                                               : readInput (static_cast<int64_t> (absoluteSample) + n - analysisPeriod));
+                correlation += x * delayed;
+                delayedEnergy += delayed * delayed;
+            }
+        }
+        const auto highFrequencyRatio = std::clamp (differenceEnergy / totalEnergy, 0.0, 4.0);
+        const auto periodicCoherence = analysisPeriod > 0
+                                     ? std::abs (correlation) / std::sqrt (totalEnergy * delayedEnergy)
+                                     : 0.0;
+        // A terminal /s/ or /sh/ can inherit a plausible F0 from the vowel
+        // immediately before it, so the old strict thresholds left it in
+        // TD-PSOLA long enough for the high band to turn into an electrical
+        // rasp. Admit high-frequency, weakly-periodic material sooner while
+        // still requiring both tests: bright periodic vowels remain wet.
+        const auto highFrequencyEvidence = std::clamp ((highFrequencyRatio - 0.38) / 0.70, 0.0, 1.0);
+        const auto nonPeriodicEvidence = std::clamp ((0.74 - periodicCoherence) / 0.30, 0.0, 1.0);
+        const auto nonPeriodicResidualTarget = valid && ! forceDry
+                                             ? std::sqrt (highFrequencyEvidence * nonPeriodicEvidence)
+                                             : 0.0;
+        const auto correctionTextureEvidence = std::clamp ((std::abs (requestedCorrectionCents) - 12.0) / 48.0,
+                                                           0.0, 1.0);
+        const auto periodicResidualTarget = diagnosticAblation.periodicResidual
+                                          && valid && ! forceDry && periodicCoherence >= periodicResidualMinimumCoherence
+                                          ? periodicResidualMaximumMix * correctionTextureEvidence
+                                          : 0.0;
+        const auto sibilanceResidualTarget = std::max (nonPeriodicResidualTarget, periodicResidualTarget);
+        diagnosticState.highFrequencyEvidence = highFrequencyEvidence;
+        diagnosticState.periodicCoherence = periodicCoherence;
+
+        // A terminal plosive can be entirely unvoiced yet contain a short,
+        // disproportionately loud low/mid burst. It should not be flattened
+        // globally like a compressor: establish a local unvoiced floor,
+        // catch only a fast low-frequency rise above it, and leave vowels
+        // and high-frequency sibilance outside this path.
+        const auto blockRms = std::sqrt (totalEnergy / static_cast<double> (samples));
+        auto unvoicedBurstGainTarget = 1.0;
+        if (! valid && ! forceDry)
+        {
+            if (wasValid || unvoicedBurstBaselineRms <= 1.0e-8)
+            {
+                unvoicedBurstBaselineRms = blockRms;
+            }
+            else
+            {
+                const auto riseDb = 20.0 * std::log10 ((blockRms + 1.0e-12)
+                                                        / (unvoicedBurstBaselineRms + 1.0e-12));
+                if (highFrequencyEvidence < unvoicedBurstMaximumHighFrequencyEvidence
+                    && riseDb > unvoicedBurstRiseThresholdDb)
+                {
+                    const auto attenuationDb = std::clamp ((riseDb - unvoicedBurstRiseThresholdDb)
+                                                          * unvoicedBurstRatio,
+                                                          0.0, unvoicedBurstMaximumAttenuationDb);
+                    unvoicedBurstGainTarget = std::pow (10.0, -attenuationDb / 20.0);
+                }
+
+                // Follow a falling unvoiced floor promptly, but absorb a
+                // rising burst only very slowly so it cannot raise its own
+                // threshold while it is being controlled.
+                const auto baselineAlpha = blockRms < unvoicedBurstBaselineRms
+                                         ? unvoicedBurstFloorFallAlpha
+                                         : unvoicedBurstFloorRiseAlpha;
+                unvoicedBurstBaselineRms += (blockRms - unvoicedBurstBaselineRms) * baselineAlpha;
+            }
+        }
+        else
+        {
+            unvoicedBurstBaselineRms = 0.0;
+        }
+
+        for (int n = 0; n < samples; ++n, ++absoluteSample)
+        {
+            retireAudibleScheduledGrains();
+            input[index (absoluteSample)] = source[n];
+            const auto outIndex = index (absoluteSample);
+            const auto weight = outputWeight[outIndex];
+            diagnosticState.currentOverlapWeight = weight;
+            if (weight > 1.0e-6f)
+            {
+                diagnosticState.audibleRatioAtStart = outputRatioSum[outIndex] / weight;
+                diagnosticState.audibleGrainAge = outputAgeSum[outIndex] / weight;
+                diagnosticState.audibleReadPosition = outputReadPositionSum[outIndex] / weight;
+                diagnosticState.audibleSourceMarkTime = outputSourceMarkSum[outIndex] / weight;
+                diagnosticState.audibleSourceMarkF0 = outputSourceF0Sum[outIndex] / weight;
+                diagnosticState.audibleExpectedGrainF0 = outputExpectedF0Sum[outIndex] / weight;
+                diagnosticState.dominantGrainWeight = outputDominantWeight[outIndex];
+                diagnosticState.dominantGrainEpoch = outputDominantEpoch[outIndex];
+                diagnosticState.dominantGrainRatio = outputDominantRatio[outIndex];
+                diagnosticState.dominantGrainExpectedF0 = outputDominantExpectedF0[outIndex];
+                diagnosticState.dominantGrainTargetMidi = outputDominantTargetMidi[outIndex];
+                diagnosticState.dominantGrainTargetEventId = outputDominantTargetEventId[outIndex];
+                diagnosticState.dominantGrainTargetControlTimestamp = outputDominantTargetTimestamp[outIndex];
+                if (targetIsUsable)
+                {
+                    for (const auto& grain : scheduledGrains)
+                    {
+                        if (! grain.active || absoluteSample + grain.halfWindow < grain.synthesisMark
+                            || absoluteSample > grain.synthesisMark + grain.halfWindow)
+                            continue;
+                        const auto expectedHz = (sampleRate / grain.sourceMark.period) * grain.ratioAtStart;
+                        if (std::abs (1200.0 * std::log2 (expectedHz / committedTargetHz)) > 25.0)
+                            continue;
+                        const auto offset = static_cast<int> (absoluteSample - grain.synthesisMark);
+                        const auto phase = static_cast<float> (offset) / static_cast<float> (grain.halfWindow);
+                        const auto candidateWeight = 0.5 * (1.0 + std::cos (3.14159265358979323846 * phase));
+                        if (candidateWeight > diagnosticState.targetCandidateWeight)
+                        {
+                            diagnosticState.targetCandidateWeight = candidateWeight;
+                            diagnosticState.targetCandidateEpoch = static_cast<double> (grain.synthesisMark);
+                            diagnosticState.targetCandidateExpectedF0 = expectedHz;
+                        }
+                    }
+                }
+            }
+            const auto dry = readInput (static_cast<int64_t> (absoluteSample) - latency);
+            const auto grainAvailable = weight > 1.0e-6f;
+            auto wet = grainAvailable ? outputSum[outIndex] / weight : dry;
+            outputSum[outIndex] = 0.0f;
+            outputWeight[outIndex] = 0.0f;
+            outputRatioSum[outIndex] = outputAgeSum[outIndex] = outputReadPositionSum[outIndex] = 0.0;
+            outputSourceMarkSum[outIndex] = outputSourceF0Sum[outIndex] = outputExpectedF0Sum[outIndex] = 0.0;
+            outputDominantWeight[outIndex] = 0.0f;
+            outputDominantEpoch[outIndex] = -1.0;
+            outputDominantRatio[outIndex] = 1.0;
+            outputDominantExpectedF0[outIndex] = 0.0;
+            outputDominantTargetMidi[outIndex] = -1;
+            outputDominantTargetEventId[outIndex] = -1.0;
+            outputDominantTargetTimestamp[outIndex] = -1.0;
+
+            // Colour only the already-pitch-shifted, periodic wet vowel.
+            // This leaves target selection, grain cadence, and the later
+            // dry high-band residual completely untouched.
+            wet = voicedColour.processWetSample (wet, valid, periodicCoherence,
+                                                  sibilanceResidualMix, voicedColourAmountPercent);
+
+            // A voiced signal stays in one continuous processed path.  A
+            // note already at target uses ratio == 1, it does not bypass to
+            // a separate dry signal.  This keeps the renderer's phase and
+            // spectral state continuous as correction starts and stops.
+            auto shouldRenderWet = valid && ! forceDry;
+            if (safetyDrySamples > 0)
+            {
+                diagnosticState.reentryHoldActive = true;
+                diagnosticState.dryGuardActive = true;
+                --safetyDrySamples;
+                shouldRenderWet = false;
+            }
+            if (forceDry)
+                diagnosticState.dryGuardActive = true;
+
+            if (shouldRenderWet && wetMix >= artifactVetoMinimumWetMix && hasPreviousOutput
+                && std::abs (wet - previousOutput) > artifactStepThreshold
+                && std::abs (dry - previousOutput) < dryContinuityThreshold)
+            {
+                diagnosticState.artifactDryVeto = true;
+            }
+
+            // A voiced stream remains in the processed path, but a wet fade
+            // cannot start before an actual OLA grain exists. Otherwise the
+            // fade reaches 50–70% while wet == dry, then the first grain
+            // enters abruptly and clicks. This is a grain-availability gate
+            // for the entry fade, not a near-unity dry bypass.
+            const auto grainStarved = shouldRenderWet && ! grainAvailable;
+            diagnosticState.grainStarved = grainStarved;
+            const auto mixTarget = shouldRenderWet && grainAvailable ? 1.0 : 0.0;
+            diagnosticState.shouldRenderWet = shouldRenderWet;
+            diagnosticState.remainingSafetyDrySamples = safetyDrySamples;
+            // At an invalid/transient boundary the scheduled grain belongs
+            // to the preceding vowel.  Leave it quickly for aligned dry;
+            // wet re-entry remains the longer equal-power fade.
+            wetMix += (mixTarget - wetMix) * (valid ? mixAlpha : releaseMixAlpha);
+            const auto equalPowerWet = std::sin (0.5 * 3.14159265358979323846 * wetMix);
+            // Attack faster than release: protect the first samples of a
+            // consonant, then return gently to the wet vowel path without a
+            // treble zipper/click.
+            const auto residualSeconds = sibilanceResidualTarget > sibilanceResidualMix
+                                       ? sibilanceResidualAttackSeconds
+                                       : sibilanceResidualReleaseSeconds;
+            const auto residualMixAlpha = 1.0 - std::exp (-1.0 / (residualSeconds * sampleRate));
+            sibilanceResidualMix += (sibilanceResidualTarget - sibilanceResidualMix) * residualMixAlpha;
+            // The matching low-pass states make this a continuous high-band
+            // crossover, rather than summing a full dry vocal over the wet
+            // signal.  Its periodic contribution is deliberately capped at
+            // a few percent; it restores edge, not source pitch.
+            constexpr auto crossoverHz = 2800.0;
+            const auto lowAlpha = 1.0 - std::exp (-2.0 * 3.14159265358979323846 * crossoverHz / sampleRate);
+            wetLowState += (static_cast<double> (wet) - wetLowState) * lowAlpha;
+            dryLowState += (static_cast<double> (dry) - dryLowState) * lowAlpha;
+            const auto hybridWet = static_cast<double> (wet)
+                                 + (static_cast<double> (dry) - dryLowState - (static_cast<double> (wet) - wetLowState))
+                                   * sibilanceResidualMix;
+            const auto burstGainSeconds = unvoicedBurstGainTarget < unvoicedBurstGain
+                                        ? unvoicedBurstAttackSeconds
+                                        : unvoicedBurstReleaseSeconds;
+            const auto burstGainAlpha = 1.0 - std::exp (-1.0 / (burstGainSeconds * sampleRate));
+            unvoicedBurstGain += (unvoicedBurstGainTarget - unvoicedBurstGain) * burstGainAlpha;
+            destination[n] = static_cast<float> ((dry + (hybridWet - dry) * equalPowerWet) * unvoicedBurstGain);
+            previousOutput = destination[n];
+            hasPreviousOutput = true;
+
+            if (! valid)
+                continue;
+
+            smoothedRatio += (ratioTarget - smoothedRatio) * ratioAlpha;
+            // Confirm a predicted source epoch only after a small part of
+            // the following cycle is safely in history. This lets one
+            // continuous tracker compare both sides of the candidate rather
+            // than independently anchoring every grain to a formant peak.
+            if (hasPendingSourceMark
+                && absoluteSample >= pendingSourceMarkSample
+                                     + static_cast<uint64_t> (pitchMarkSearchRadius (pendingSourceMarkPeriod)))
+            {
+                pushMark ({ refineCompletedEpoch (pendingSourceMarkSample, pendingSourceMarkPeriod),
+                            pendingSourceMarkPeriod });
+                hasPendingSourceMark = false;
+            }
+            sourcePhase += f0Hz / sampleRate;
+            // A committed note owns synthesis cadence. Source F0/ratio still
+            // choose the grain sequence, but cannot bend the output lattice
+            // away from this note between adjacent grains.
+            const auto activeSynthesisFrequency = targetIsUsable ? committedTargetHz
+                                                                  : f0Hz * smoothedRatio;
+            synthPhase += activeSynthesisFrequency / sampleRate;
+            if (sourcePhase >= 1.0)
+            {
+                sourcePhase -= std::floor (sourcePhase);
+                const auto period = sampleRate / f0Hz;
+                pendingSourceMarkSample = absoluteSample;
+                pendingSourceMarkPeriod = period;
+                hasPendingSourceMark = true;
+            }
+            const auto reachedRetimedEpoch = pendingSynthesisMark >= 0.0
+                                          && static_cast<double> (absoluteSample + latency) >= pendingSynthesisMark;
+            if ((synthPhase >= 1.0 || reachedRetimedEpoch) && markCount > 0)
+            {
+                if (reachedRetimedEpoch)
+                {
+                    // The retimed epoch replaces the old-rate pending one;
+                    // start the following period from this exact mark.
+                    synthPhase = 0.0;
+                    pendingSynthesisMark = -1.0;
+                }
+                else
+                {
+                    synthPhase -= std::floor (synthPhase);
+                    pendingSynthesisMark = -1.0;
+                }
+                SourceMark safeMark {};
+                SourceMark newestCompleteMark {};
+                const auto hasNewestCompleteMark = findLatestCompleteMark (absoluteSample, newestCompleteMark);
+                if (hasNewestCompleteMark)
+                    diagnosticState.newestCompleteSourceMark = static_cast<double> (newestCompleteMark.sample);
+                if (! hasSourceMarkCursor)
+                {
+                    if (hasNewestCompleteMark)
+                    {
+                        sourceMarkCursor = static_cast<double> (newestCompleteMark.sample);
+                        hasSourceMarkCursor = true;
+                    }
+                }
+                else if (hasNewestCompleteMark)
+                {
+                    // Source selection may fall behind after a voiced F0
+                    // change: a stale 160 Hz grain paired with a current
+                    // 220 Hz synthesis lattice creates the metallic buzz
+                    // heard on vocal.  Re-align only this *selection cursor*
+                    // once it is more than 1.5 current periods late.  The
+                    // synthesis phase and queued OLA grains remain intact.
+                    // A pitch-down output has a longer synthesis period, so
+                    // its source cursor naturally trails by more than one
+                    // input cycle. Treating that expected lag as stale makes
+                    // the selector periodically jump forward and biases the
+                    // rendered pitch back upward.
+                    const auto maximumSelectionLag = 1.5
+                                                   * std::max (newestCompleteMark.period, sampleRate / f0Hz);
+                    if (sourceMarkCursor < static_cast<double> (newestCompleteMark.sample)
+                                          - maximumSelectionLag)
+                        sourceMarkCursor = static_cast<double> (newestCompleteMark.sample);
+
+                    // At a certified control step, start the new grain from
+                    // the newest complete epoch. The outgoing grain remains
+                    // in OLA, so this updates source ownership without
+                    // cutting its audible tail.
+                    if (strongRatioStep)
+                        sourceMarkCursor = static_cast<double> (newestCompleteMark.sample);
+
+                }
+                if (hasSourceMarkCursor
+                    && findCompleteMarkNearest (sourceMarkCursor, absoluteSample, safeMark))
+                {
+                    // Candidate forensic mode: the target/synthesis clock is
+                    // deliberately untouched.  Only the already-complete
+                    // source grain is centred on a repeatable vocal epoch.
+                    // The bound rejects any correlation solution that would
+                    // turn a formant peak into a different cycle.
+                    if (diagnosticAblation.waveformAnchoredSourceMarks)
+                    {
+                        const auto latticeMark = safeMark;
+                        const auto resolvedMark = resolvePitchSynchronousMark (safeMark);
+                        const auto maximumAnchorOffset = 0.08 * safeMark.period;
+                        if (std::abs (static_cast<double> (resolvedMark.sample)
+                                      - static_cast<double> (latticeMark.sample)) <= maximumAnchorOffset)
+                            safeMark = resolvedMark;
+                    }
+                    // Evidence only. This may never move a mark until its
+                    // confidence and temporal continuity are validated over
+                    // real vocal passages; formant peaks are not pitch marks.
+                    const auto pitchMarkEvidence = measureExcitationEpoch (safeMark);
+                    diagnosticState.pitchMarkCandidateOffset = pitchMarkEvidence.offsetSamples;
+                    diagnosticState.pitchMarkCandidateCorrelation = pitchMarkEvidence.periodicCorrelation;
+                    // A raw local offset can be a formant maximum. It becomes
+                    // usable only after repeated, high-correlation agreement
+                    // across adjacent cycles, then it is allowed to move the
+                    // read phase gradually. This never changes the synthesis
+                    // cadence or target pitch.
+                    const auto agreesWithPrevious = hasPreviousExcitationEvidence
+                                                 && std::abs (pitchMarkEvidence.offsetSamples
+                                                              - previousExcitationEvidenceOffset) <= 2.0;
+                    if (pitchMarkEvidence.periodicCorrelation >= 0.88 && agreesWithPrevious)
+                    {
+                        excitationEvidenceRun = std::min (excitationEvidenceRun + 1, 16);
+                        if (excitationEvidenceRun >= 3)
+                            confirmedExcitationOffset += std::clamp (pitchMarkEvidence.offsetSamples
+                                                                      - confirmedExcitationOffset,
+                                                                      -0.40, 0.40);
+                    }
+                    else
+                    {
+                        excitationEvidenceRun = 0;
+                        // Let a formerly confirmed offset return to the
+                        // lattice rather than holding it through a formant or
+                        // voiced transition.
+                        confirmedExcitationOffset *= 0.75;
+                    }
+                    previousExcitationEvidenceOffset = pitchMarkEvidence.offsetSamples;
+                    hasPreviousExcitationEvidence = pitchMarkEvidence.periodicCorrelation >= 0.88;
+                    const auto synthesisMark = absoluteSample + static_cast<uint64_t> (latency);
+                    // Steady vowels deliberately retain the deterministic
+                    // source lattice: that is what gives a Retune-0 note its
+                    // firm, flat plateau.  During a real correction step,
+                    // however, repeating the exact same source alignment in
+                    // every overlapping grain makes the handoff unnaturally
+                    // static/dull.  Use the already-queued OLA waveform as
+                    // the phase reference only for that local handoff.  The
+                    // estimate is bounded to +/- 4 samples and accepted only
+                    // on a high correlation, so it never resets a phase,
+                    // changes pitch cadence, or creates a second wet voice.
+                    auto fractionalPhaseOffset = estimateFractionalPhaseOffset (safeMark);
+                    // A rising return must establish a new note rather than
+                    // be phase-matched into the tail of the preceding lower
+                    // note. Keep overlap matching on descending hand-offs,
+                    // where it has already proved beneficial for continuity.
+                    if (strongRatioStep && ! risingCorrectionStep)
+                        fractionalPhaseOffset += estimateOverlapPhaseOffset (safeMark, synthesisMark);
+                    auto ratioAtGrainStart = smoothedRatio;
+                    addCentredGrain (safeMark, synthesisMark, ratioAtGrainStart,
+                                     fractionalPhaseOffset, analysisHalfWindowFactor,
+                                     strongRatioStep);
+                    lastSpawnEpoch = static_cast<double> (synthesisMark);
+                    lastSpawnRatio = smoothedRatio;
+                    sourceMarkCursor += safeMark.period / smoothedRatio;
+                    previousSelectedSourceMark = safeMark;
+                    hasPreviousSelectedSourceMark = true;
+                    previousFractionalPhaseOffset = fractionalPhaseOffset;
+                }
+            }
+        }
+        diagnosticState.activeRatio = smoothedRatio;
+        diagnosticState.sourcePhase = sourcePhase;
+        diagnosticState.synthesisPhase = synthPhase;
+        diagnosticState.queuedMarks = static_cast<int> (markCount);
+        diagnosticState.scheduledFutureGrains = countScheduledFutureGrains();
+        diagnosticState.wetMix = wetMix;
+        diagnosticState.actualSpawnEpoch = lastSpawnEpoch;
+        diagnosticState.ratioAtSpawn = lastSpawnRatio;
+        diagnosticState.targetMidiAtSpawn = lastSpawnTargetMidi;
+        diagnosticState.targetEventIdAtSpawn = lastSpawnTargetEventId;
+        diagnosticState.targetControlTimestampAtSpawn = lastSpawnTargetControlTimestamp;
+        diagnosticState.sourcePeriodAtSpawn = lastSpawnSourcePeriod;
+        diagnosticState.expectedOutputPeriod = lastExpectedOutputPeriod;
+        diagnosticState.previousSynthMark = lastPreviousSynthesisMark;
+        diagnosticState.currentSynthMark = lastSpawnEpoch;
+        diagnosticState.actualSynthPeriod = lastActualSynthesisPeriod;
+        diagnosticState.expectedSynthPeriodError = lastExpectedSynthesisPeriodError;
+        diagnosticState.actualSourceMarkSpacing = lastSourceMarkSpacing;
+        diagnosticState.sourceSelectionCursor = sourceMarkCursor;
+        diagnosticState.confirmedPitchMarkOffset = confirmedExcitationOffset;
+        diagnosticState.confirmedPitchMarkRun = excitationEvidenceRun;
+        diagnosticState.sibilanceResidualMix = sibilanceResidualMix;
+    }
+
+private:
+    size_t index (uint64_t sample) const noexcept { return static_cast<size_t> (sample % static_cast<uint64_t> (ringLength)); }
+    float readInput (int64_t sample) const noexcept
+    {
+        if (sample < 0 || sample >= static_cast<int64_t> (absoluteSample + 1)
+            || sample < static_cast<int64_t> (absoluteSample) - ringLength)
+            return 0.0f;
+        return input[index (static_cast<uint64_t> (sample))];
+    }
+    void pushMark (SourceMark mark) noexcept
+    {
+        marks[markWrite] = mark;
+        markWrite = (markWrite + 1) % marks.size();
+        markCount = std::min (markCount + 1, marks.size());
+        previousEpoch = mark;
+        hasPreviousEpoch = true;
+    }
+    const SourceMark& latestMark() const noexcept
+    {
+        return marks[(markWrite + marks.size() - 1) % marks.size()];
+    }
+    bool findLatestCompleteMark (uint64_t now, SourceMark& result) const noexcept
+    {
+        // A centred grain has one source period on either side of its mark.
+        // Search newest-first so the source trajectory stays close to the
+        // current vocal while remaining strictly causal.
+        for (size_t age = 0; age < markCount; ++age)
+        {
+            const auto slot = (markWrite + marks.size() - 1 - age) % marks.size();
+            const auto& candidate = marks[slot];
+            const auto halfWindow = static_cast<uint64_t> (std::clamp (
+                static_cast<int> (std::lround (candidate.period * analysisHalfWindowFactor)), 32, 512));
+            if (candidate.sample >= halfWindow && candidate.sample + halfWindow <= now)
+            {
+                result = candidate;
+                return true;
+            }
+        }
+        return false;
+    }
+    bool findCompleteMarkNearest (double desiredSample, uint64_t now, SourceMark& result) const noexcept
+    {
+        auto bestDistance = std::numeric_limits<double>::infinity();
+        auto found = false;
+        for (size_t age = 0; age < markCount; ++age)
+        {
+            const auto slot = (markWrite + marks.size() - 1 - age) % marks.size();
+            const auto& candidate = marks[slot];
+            const auto halfWindow = static_cast<uint64_t> (std::clamp (
+                static_cast<int> (std::lround (candidate.period * analysisHalfWindowFactor)), 32, 512));
+            if (candidate.sample < halfWindow || candidate.sample + halfWindow > now)
+                continue;
+            const auto distance = std::abs (static_cast<double> (candidate.sample) - desiredSample);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                result = candidate;
+                found = true;
+            }
+        }
+        return found;
+    }
+    static int pitchMarkSearchRadius (double period) noexcept
+    {
+        return std::clamp (static_cast<int> (std::lround (period * 0.14)), 4, 48);
+    }
+    uint64_t refineCompletedEpoch (uint64_t predicted, double period) const noexcept
+    {
+        if (! hasPreviousEpoch)
+            return predicted;
+        // Select a completed cycle by waveform similarity to the preceding
+        // epoch. Unlike a raw zero crossing, this rejects formant-driven
+        // polarity changes that would move a TD-PSOLA grain into a wrong
+        // cycle. The search is strictly history-only and adds no latency.
+        const auto comparisonLength = std::clamp (static_cast<int> (std::lround (std::min (period, previousEpoch.period))),
+                                                  32, 192);
+        const auto radius = pitchMarkSearchRadius (period);
+        auto best = predicted;
+        auto bestScore = -2.0;
+        // The caller waits until predicted + radius is in history, so both
+        // sides of this narrow search are available without extra latency.
+        for (int offset = -radius; offset <= radius; ++offset)
+        {
+            const auto candidate = static_cast<int64_t> (predicted) + offset;
+            double dot = 0.0, candidateEnergy = 0.0, previousEnergy = 0.0;
+            for (int i = 0; i < comparisonLength; ++i)
+            {
+                const auto a = static_cast<double> (readInput (candidate - comparisonLength + 1 + i));
+                const auto b = static_cast<double> (readInput (static_cast<int64_t> (previousEpoch.sample)
+                                                                 - comparisonLength + 1 + i));
+                dot += a * b;
+                candidateEnergy += a * a;
+                previousEnergy += b * b;
+            }
+            const auto score = dot / std::sqrt (candidateEnergy * previousEnergy + 1.0e-12);
+            if (score > bestScore) { bestScore = score; best = static_cast<uint64_t> (candidate); }
+        }
+        return best;
+    }
+    SourceMark resolvePitchSynchronousMark (SourceMark mark) const noexcept
+    {
+        // The F0 lattice tells us the expected cycle; the source waveform
+        // tells us where the actual pitch epoch is.  Resolve only after the
+        // mark is safely in history, by maximizing one-cycle normalized
+        // correlation in a narrow window.  This is phase/pulse detection,
+        // not a target or retune change.
+        const auto sourcePeriod = std::clamp (static_cast<int> (std::lround (mark.period)), 48, 512);
+        const auto searchRadius = std::clamp (static_cast<int> (std::lround (mark.period * 0.16)), 6, 48);
+        const auto comparisonLength = std::clamp (sourcePeriod, 48, 192);
+        auto bestOffset = 0;
+        auto bestScore = -2.0;
+        for (int offset = -searchRadius; offset <= searchRadius; ++offset)
+        {
+            const auto centre = static_cast<int64_t> (mark.sample) + offset;
+            double dot = 0.0, currentEnergy = 0.0, priorEnergy = 0.0;
+            for (int i = 0; i < comparisonLength; ++i)
+            {
+                const auto relative = i - comparisonLength / 2;
+                const auto current = static_cast<double> (readInput (centre + relative));
+                const auto prior = static_cast<double> (readInput (centre - sourcePeriod + relative));
+                dot += current * prior;
+                currentEnergy += current * current;
+                priorEnergy += prior * prior;
+            }
+            const auto score = dot / std::sqrt (currentEnergy * priorEnergy + 1.0e-12);
+            if (score > bestScore) { bestScore = score; bestOffset = offset; }
+        }
+        // Do not let a breath/formant frame invent a new epoch.  Low
+        // confidence stays on the continuous F0 lattice instead.
+        if (bestScore >= waveformEpochAnchorMinimumCorrelation)
+            mark.sample = static_cast<uint64_t> (std::max<int64_t> (0, static_cast<int64_t> (mark.sample) + bestOffset));
+        return mark;
+    }
+    PitchMarkEvidence measureExcitationEpoch (const SourceMark& mark) const noexcept
+    {
+        // Use a first-difference excitation proxy, not raw waveform height.
+        // Formants can dominate raw correlation, whereas a glottal pulse is
+        // more visible in the local excitation slope.  This is measurement
+        // only: no audio timing is changed by this function.
+        const auto sourcePeriod = std::clamp (static_cast<int> (std::lround (mark.period)), 48, 512);
+        const auto searchRadius = std::clamp (static_cast<int> (std::lround (mark.period * 0.12)), 4, 32);
+        const auto comparisonLength = std::clamp (sourcePeriod, 48, 160);
+        PitchMarkEvidence result {};
+        auto bestScore = -2.0;
+        for (int offset = -searchRadius; offset <= searchRadius; ++offset)
+        {
+            const auto centre = static_cast<int64_t> (mark.sample) + offset;
+            double dot = 0.0, currentEnergy = 0.0, previousEnergy = 0.0;
+            for (int i = 0; i < comparisonLength; ++i)
+            {
+                const auto relative = i - comparisonLength / 2;
+                const auto currentIndex = centre + relative;
+                const auto previousIndex = currentIndex - sourcePeriod;
+                const auto current = static_cast<double> (readInput (currentIndex) - readInput (currentIndex - 1));
+                const auto previous = static_cast<double> (readInput (previousIndex) - readInput (previousIndex - 1));
+                dot += current * previous;
+                currentEnergy += current * current;
+                previousEnergy += previous * previous;
+            }
+            const auto score = dot / std::sqrt (currentEnergy * previousEnergy + 1.0e-12);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                result.offsetSamples = static_cast<double> (offset);
+            }
+        }
+        result.periodicCorrelation = bestScore;
+        return result;
+    }
+    double estimateFractionalPhaseOffset (const SourceMark& mark) const noexcept
+    {
+        if (! hasPreviousSelectedSourceMark)
+            return 0.0;
+        const auto rawDistance = static_cast<double> (mark.sample)
+                               - static_cast<double> (previousSelectedSourceMark.sample);
+        if (std::abs (rawDistance) < mark.period * 0.30)
+            return previousFractionalPhaseOffset;
+        const auto comparisonLength = std::clamp (static_cast<int> (std::lround (
+            std::min (mark.period, previousSelectedSourceMark.period))), 48, 192);
+        constexpr auto phaseSearchRadius = 0;
+        std::array<double, 2 * phaseSearchRadius + 1> scores {};
+        auto bestIndex = phaseSearchRadius;
+        auto bestScore = -2.0;
+        for (int offset = -phaseSearchRadius; offset <= phaseSearchRadius; ++offset)
+        {
+            double dot = 0.0, candidateEnergy = 0.0, previousEnergy = 0.0;
+            for (int i = 0; i < comparisonLength; ++i)
+            {
+                const auto a = static_cast<double> (readInput (static_cast<int64_t> (mark.sample) + offset
+                                                                 - comparisonLength / 2 + i));
+                const auto b = static_cast<double> (readInput (static_cast<int64_t> (previousSelectedSourceMark.sample)
+                                                                 - comparisonLength / 2 + i));
+                dot += a * b;
+                candidateEnergy += a * a;
+                previousEnergy += b * b;
+            }
+            const auto score = dot / std::sqrt (candidateEnergy * previousEnergy + 1.0e-12);
+            scores[static_cast<size_t> (offset + phaseSearchRadius)] = score;
+            if (score > bestScore) { bestScore = score; bestIndex = offset + phaseSearchRadius; }
+        }
+        auto fractional = 0.0;
+        if (bestIndex > 0 && bestIndex + 1 < static_cast<int> (scores.size()))
+        {
+            const auto left = scores[static_cast<size_t> (bestIndex - 1)];
+            const auto centre = scores[static_cast<size_t> (bestIndex)];
+            const auto right = scores[static_cast<size_t> (bestIndex + 1)];
+            const auto denominator = left - 2.0 * centre + right;
+            if (std::abs (denominator) > 1.0e-9)
+                fractional = std::clamp (0.5 * (left - right) / denominator, -0.5, 0.5);
+        }
+        return static_cast<double> (bestIndex - phaseSearchRadius) + fractional;
+    }
+    double estimateOverlapPhaseOffset (const SourceMark& mark, uint64_t synthesisMark) const noexcept
+    {
+        // Align a new grain to the actual waveform already scheduled in its
+        // OLA overlap. Unlike source-to-source correlation, this measures the
+        // signal the listener will receive and cannot alter output cadence.
+        constexpr int searchRadius = 4;
+        const auto halfWindow = std::clamp (static_cast<int> (std::lround (mark.period * analysisHalfWindowFactor)), 32, 512);
+        auto bestOffset = 0;
+        auto bestScore = -2.0;
+        for (int sourceOffset = -searchRadius; sourceOffset <= searchRadius; ++sourceOffset)
+        {
+            double dot = 0.0, candidateEnergy = 0.0, existingEnergy = 0.0;
+            auto count = 0;
+            for (int relative = -halfWindow + searchRadius; relative <= halfWindow - searchRadius; relative += 4)
+            {
+                const auto destination = static_cast<int64_t> (synthesisMark) + relative;
+                if (destination < static_cast<int64_t> (absoluteSample) + 1)
+                    continue;
+                const auto destinationIndex = index (static_cast<uint64_t> (destination));
+                const auto existingWeight = outputWeight[destinationIndex];
+                if (existingWeight < 0.10f)
+                    continue;
+                const auto phase = static_cast<float> (relative) / static_cast<float> (halfWindow);
+                const auto window = 0.5f * (1.0f + std::cos (3.14159265358979323846f * phase));
+                const auto candidate = static_cast<double> (readInputInterpolated (
+                    static_cast<double> (mark.sample + relative) + sourceOffset)) * window;
+                const auto existing = static_cast<double> (outputSum[destinationIndex] / existingWeight);
+                dot += candidate * existing;
+                candidateEnergy += candidate * candidate;
+                existingEnergy += existing * existing;
+                ++count;
+            }
+            if (count < 16)
+                continue;
+            const auto score = dot / std::sqrt (candidateEnergy * existingEnergy + 1.0e-12);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestOffset = sourceOffset;
+            }
+        }
+        // Do not invent alignment where the future OLA contains no reliable
+        // comparison signal (such as the first grain after re-entry).
+        return bestScore >= 0.72 ? static_cast<double> (bestOffset) : 0.0;
+    }
+    float readInputInterpolated (double sample) const noexcept
+    {
+        const auto first = static_cast<int64_t> (std::floor (sample));
+        const auto fraction = static_cast<float> (sample - static_cast<double> (first));
+        return readInput (first) + (readInput (first + 1) - readInput (first)) * fraction;
+    }
+
+    void addCentredGrain (const SourceMark& mark, uint64_t synthesisMark, double ratioAtStart,
+                          double fractionalPhaseOffset, double windowHalfFactor,
+                          bool transitionBodyEmphasis) noexcept
+    {
+        const auto currentSynthesisMark = static_cast<double> (synthesisMark);
+        const auto expectedPeriod = mark.period / ratioAtStart;
+        lastPreviousSynthesisMark = previousSynthesisMark;
+        lastActualSynthesisPeriod = previousSynthesisMark >= 0.0 ? currentSynthesisMark - previousSynthesisMark : 0.0;
+        lastExpectedSynthesisPeriodError = previousSynthesisMark >= 0.0 ? lastActualSynthesisPeriod - expectedPeriod : 0.0;
+        lastSourceMarkSpacing = previousSourceMarkSample >= 0.0 ? static_cast<double> (mark.sample) - previousSourceMarkSample : 0.0;
+        previousSynthesisMark = currentSynthesisMark;
+        previousSourceMarkSample = static_cast<double> (mark.sample);
+        lastSpawnSourcePeriod = mark.period;
+        lastExpectedOutputPeriod = expectedPeriod;
+        const auto halfWindow = std::clamp (static_cast<int> (std::lround (mark.period * windowHalfFactor)), 32, 512);
+        ScheduledGrain grain { mark, synthesisMark, ratioAtStart, fractionalPhaseOffset, halfWindow, true };
+        // Keep the transparent Hann window for unshifted/near-unity audio.
+        // In a real hard correction, blend only a small Hamming shoulder into
+        // the new grain.  Its non-zero edge retains more of the grain body
+        // (therefore harmonic density) while OLA normalisation below still
+        // makes the sum continuous.  This is deliberately a per-grain,
+        // ratio-at-spawn decision: no window is changing underneath an
+        // audible grain and no EQ/dry copy is added.
+        for (int offset = -halfWindow; offset <= halfWindow; ++offset)
+            addGrainSampleContribution (grain, offset, 1.0, transitionBodyEmphasis);
+        rememberScheduledGrain (grain);
+    }
+
+    void addGrainSampleContribution (const ScheduledGrain& grain, int offset, double gain,
+                                     bool transitionBodyEmphasis = false) noexcept
+    {
+        const auto destination = static_cast<int64_t> (grain.synthesisMark) + offset;
+        if (destination < static_cast<int64_t> (absoluteSample) + 1)
+            return;
+        const auto phase = static_cast<float> (offset) / static_cast<float> (grain.halfWindow);
+        const auto cosine = std::cos (3.14159265358979323846f * phase);
+        const auto hann = 0.5f * (1.0f + cosine);
+        const auto correctionCents = std::abs (1200.0 * std::log2 (std::max (grain.ratioAtStart, 1.0e-12)));
+        const auto hammingBlend = diagnosticAblation.correctionWindowBlend
+                                ? std::clamp ((correctionCents - 6.0) / 30.0,
+                                              0.0, transitionBodyEmphasis
+                                                        ? rapidTransitionWindowMaximumHammingBlend
+                                                        : hardTuneWindowMaximumHammingBlend)
+                                : 0.0;
+        const auto hamming = 0.54f + 0.46f * cosine;
+        const auto weight = static_cast<double> (hann + (hamming - hann) * hammingBlend) * gain;
+        const auto markF0 = sampleRate / grain.sourceMark.period;
+        const auto sample = readInputInterpolated (static_cast<double> (grain.sourceMark.sample + offset)
+                                                   + grain.fractionalPhaseOffset);
+        const auto destinationIndex = index (static_cast<uint64_t> (destination));
+        outputSum[destinationIndex] += sample * static_cast<float> (weight);
+        outputWeight[destinationIndex] += static_cast<float> (weight);
+        outputRatioSum[destinationIndex] += grain.ratioAtStart * weight;
+        outputAgeSum[destinationIndex] += static_cast<double> (offset + grain.halfWindow) * weight;
+        outputReadPositionSum[destinationIndex] += static_cast<double> (grain.sourceMark.sample + offset) * weight;
+        outputSourceMarkSum[destinationIndex] += static_cast<double> (grain.sourceMark.sample) * weight;
+        outputSourceF0Sum[destinationIndex] += markF0 * weight;
+        outputExpectedF0Sum[destinationIndex] += markF0 * grain.ratioAtStart * weight;
+        if (weight > outputDominantWeight[destinationIndex])
+        {
+            outputDominantWeight[destinationIndex] = static_cast<float> (weight);
+            outputDominantEpoch[destinationIndex] = static_cast<double> (grain.synthesisMark);
+            outputDominantRatio[destinationIndex] = grain.ratioAtStart;
+            outputDominantExpectedF0[destinationIndex] = markF0 * grain.ratioAtStart;
+        }
+    }
+
+
+    void rememberScheduledGrain (const ScheduledGrain& grain) noexcept
+    {
+        // This is a future-event queue, not merely diagnostic history. An
+        // event remains addressable until every one of its contributions has
+        // become audible, which is the prerequisite for a later, safe
+        // source/synthesis reschedule.
+        for (size_t attempt = 0; attempt < scheduledGrains.size(); ++attempt)
+        {
+            auto& slot = scheduledGrains[scheduledGrainWrite];
+            scheduledGrainWrite = (scheduledGrainWrite + 1) % scheduledGrains.size();
+            if (! slot.active)
+            {
+                slot = grain;
+                return;
+            }
+        }
+    }
+
+    void retireAudibleScheduledGrains() noexcept
+    {
+        for (auto& grain : scheduledGrains)
+            if (grain.active
+                && grain.synthesisMark + static_cast<uint64_t> (grain.halfWindow) < absoluteSample)
+                grain.active = false;
+    }
+
+    int countScheduledFutureGrains() const noexcept
+    {
+        auto count = 0;
+        for (const auto& grain : scheduledGrains)
+            if (grain.active && grain.synthesisMark > absoluteSample)
+                ++count;
+        return count;
+    }
+
+    // Keep the existing guard; give the first certified wet grain a longer
+    // equal-power entry so its phase settles under the dry vocal instead of
+    // exposing a single onset tick at the end of the fade.
+    static constexpr double crossfadeSeconds = 0.010;
+    // A voiced-to-dry exit can cut across the tail of a PSOLA grain. Keep
+    // this independent from the 10.7 ms wet entry: 7 ms removes the end-word
+    // tick without delaying re-entry or changing control semantics.
+    static constexpr double releaseCrossfadeSeconds = 0.007;
+    // Golden baseline profile: this is the renderer behaviour verified by
+    // VibeAutotune-Live-Preview-hook2-preset.wav for the 0/0/0 preset.
+    static constexpr double safetyHoldSeconds = 0.0120;
+    static constexpr double rapidReversalThresholdCents = 40.0;
+    static constexpr double rapidReturnMinimumF0Hz = 180.0;
+    static constexpr uint64_t rapidReturnMaximumSamples = 9600; // 200 ms at 48 kHz
+    static constexpr double schedulerTraceThresholdCents = 18.0;
+    static constexpr float artifactStepThreshold = 0.040f;
+    static constexpr float dryContinuityThreshold = 0.060f;
+    // Never veto the initial dry -> wet entry against a previous dry sample.
+    // That comparison is structurally phase-different and otherwise traps
+    // the renderer in an endless safety-hold loop.
+    static constexpr double artifactVetoMinimumWetMix = 0.35;
+    static constexpr double minimumPitchMarkCorrelation = 0.55;
+    static constexpr double waveformEpochAnchorMinimumCorrelation = 0.82;
+    static constexpr double sibilanceResidualAttackSeconds = 0.0005;
+    static constexpr double sibilanceResidualReleaseSeconds = 0.004;
+    static constexpr double periodicResidualMinimumCoherence = 0.90;
+    static constexpr double periodicResidualMaximumMix = 0.0;
+    static constexpr double unvoicedBurstRiseThresholdDb = 3.0;
+    static constexpr double unvoicedBurstRatio = 1.5;
+    static constexpr double unvoicedBurstMaximumAttenuationDb = 6.0;
+    static constexpr double unvoicedBurstMaximumHighFrequencyEvidence = 0.25;
+    static constexpr double unvoicedBurstFloorFallAlpha = 0.35;
+    static constexpr double unvoicedBurstFloorRiseAlpha = 0.01;
+    static constexpr double unvoicedBurstAttackSeconds = 0.001;
+    static constexpr double unvoicedBurstReleaseSeconds = 0.020;
+    // A little under one period on each side keeps the current ratio from
+    // bleeding too far into an adjacent hard-tune target, while retaining
+    // enough overlap for a continuous voiced waveform.
+    static constexpr double analysisHalfWindowFactor = 0.65;
+    // The candidate remains predominantly Hann; this is enough to test the
+    // wet-body hypothesis without creating a hard window edge.
+    static constexpr double hardTuneWindowMaximumHammingBlend = 0.0;
+    // Leave the window neutral: rapid-note definition is handled by fresh
+    // source-grain ownership, not by changing the spectral window shape.
+    static constexpr double rapidTransitionWindowMaximumHammingBlend = 0.0;
+
+    double sampleRate = 48000.0, sourcePhase = 0.0, synthPhase = 0.0, smoothedRatio = 1.0, wetMix = 0.0;
+    DiagnosticAblation diagnosticAblation {};
+    int maximumBlock = 0, latency = 256, ringLength = 0;
+    uint64_t absoluteSample = 0;
+    std::vector<float> input, outputSum, outputWeight;
+    std::vector<double> outputRatioSum, outputAgeSum, outputReadPositionSum, outputSourceMarkSum, outputSourceF0Sum, outputExpectedF0Sum;
+    std::vector<float> outputDominantWeight;
+    std::vector<double> outputDominantEpoch, outputDominantRatio, outputDominantExpectedF0;
+    std::vector<int> outputDominantTargetMidi;
+    std::vector<double> outputDominantTargetEventId;
+    std::vector<double> outputDominantTargetTimestamp;
+    std::vector<SourceMark> marks;
+    std::array<ScheduledGrain, 256> scheduledGrains {};
+    size_t scheduledGrainWrite = 0;
+    size_t markWrite = 0, markCount = 0;
+    SourceMark previousEpoch {};
+    bool hasPreviousEpoch = false;
+    int safetyDrySamples = 0;
+    bool previousControlWasValid = false;
+    double previousRequestedCorrectionCents = 0.0;
+    bool hasPreviousRequestedCorrection = false;
+    float previousOutput = 0.0f;
+    bool hasPreviousOutput = false;
+    double lastSpawnEpoch = -1.0;
+    double lastSpawnRatio = 1.0;
+    double previousSynthesisMark = -1.0;
+    double previousSourceMarkSample = -1.0;
+    SourceMark previousSelectedSourceMark {};
+    bool hasPreviousSelectedSourceMark = false;
+    double previousFractionalPhaseOffset = 0.0;
+    double lastPreviousSynthesisMark = -1.0;
+    double lastActualSynthesisPeriod = 0.0;
+    double lastExpectedSynthesisPeriodError = 0.0;
+    double lastSourceMarkSpacing = 0.0;
+    double sourceMarkCursor = 0.0;
+    bool hasSourceMarkCursor = false;
+    double lastSpawnSourcePeriod = 0.0;
+    double lastExpectedOutputPeriod = 0.0;
+    int lastSpawnTargetMidi = -1;
+    double lastSpawnTargetEventId = -1.0;
+    double lastSpawnTargetControlTimestamp = -1.0;
+    bool hasPreviousCommittedTargetHz = false;
+    bool hasTargetBeforePreviousHz = false;
+    double previousCommittedTargetHz = 0.0;
+    double targetBeforePreviousHz = 0.0;
+    uint64_t previousTargetCommitSample = 0;
+    double pendingSynthesisMark = -1.0;
+    double previousExcitationEvidenceOffset = 0.0;
+    double confirmedExcitationOffset = 0.0;
+    int excitationEvidenceRun = 0;
+    bool hasPreviousExcitationEvidence = false;
+    bool hasPendingSourceMark = false;
+    uint64_t pendingSourceMarkSample = 0;
+    double pendingSourceMarkPeriod = 0.0;
+    double wetLowState = 0.0;
+    double dryLowState = 0.0;
+    double sibilanceResidualMix = 0.0;
+    double unvoicedBurstBaselineRms = 0.0;
+    double unvoicedBurstGain = 1.0;
+    VoicedColourProcessor voicedColour;
+    float voicedColourAmountPercent = 0.0f;
+    DiagnosticState diagnosticState {};
+};

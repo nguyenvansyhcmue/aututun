@@ -1,0 +1,6 @@
+ffconcat version 1.0
+file input/natural_vibrato_fs4_4hz_10ct_3s.wav
+file input/silence_350ms.wav
+file input/natural_vibrato_fs4_6hz_30ct_3s.wav
+file input/silence_350ms.wav
+file input/natural_vibrato_fs4_8hz_60ct_3s.wav

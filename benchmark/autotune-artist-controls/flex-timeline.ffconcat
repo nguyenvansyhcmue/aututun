@@ -1,0 +1,16 @@
+ffconcat version 1.0
+file input/flex_fs4_minus60ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_minus30ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_minus10ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_minus05ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_plus05ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_plus10ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_plus30ct_3s.wav
+file input/silence_350ms.wav
+file input/flex_fs4_plus60ct_3s.wav

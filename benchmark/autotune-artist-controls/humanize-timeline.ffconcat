@@ -1,0 +1,6 @@
+ffconcat version 1.0
+file input/humanize_fs4_plus30ct_vibrato5hz_30ct_3s.wav
+file input/silence_350ms.wav
+file input/humanize_fs4_plus30ct_drift20ctps_3s.wav
+file input/silence_350ms.wav
+file input/humanize_fs4_short200ms_plus30ct_vibrato5hz_30ct.wav

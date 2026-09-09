@@ -1,0 +1,19 @@
+# macOS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+
+# CMake/JUCE build products and generated plug-in bundles
+/build/
+/VibeAutotune/build/
+/dist/
+
+# Large, reproducible diagnostic artifacts and audio bounces
+/renders/
+/benchmark/**/artist-renders/
+/benchmark/**/input/*.wav
+/benchmark/**/logic-timelines/*.wav
+
+# Third-party JUCE checkouts are independently versioned.
+/JUCE/
+/JUCE_SDK/
