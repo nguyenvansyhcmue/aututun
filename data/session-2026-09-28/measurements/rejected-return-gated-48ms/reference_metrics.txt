@@ -1,0 +1,1 @@
+frames=1001 alignment_samples=2048 waveform_nrmse=1.33345 envelope_rmse_db=1.91764 spectral_rmse_db=3.31442 spectral_tilt_rmse_db=4.33505 target_max_step=0.156891 candidate_max_step=0.147347

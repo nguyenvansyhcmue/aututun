@@ -17,7 +17,26 @@ Vibrato stay at zero. Create two Flex runs: Retune 0 ms and Retune 25 ms.
 For a Humanize run, Flex and Natural Vibrato stay at zero. For a Natural
 Vibrato run, Flex and Humanize stay at zero.
 
-## Bounce matrix
+## Authoritative target data
+
+`TARGET_MANIFEST.csv` is the source of truth for every existing Artist WAV.
+It records the exact control values, source timeline, duration and SHA-256.
+The original filenames remain untouched, including legacy names that mention
+the wrong control.  Measurement tools must select a target by manifest `id`,
+not by parsing the filename.
+
+Only rows whose `status` begins with `verified` are valid calibration targets.
+`archive-controls-on-flex-input/` is deliberately excluded: it is a mixed
+control run on the Flex input, so it cannot identify Humanize or Natural
+Vibrato independently.  The raw duplicate entries in
+`archive-humanize-valid/` are also excluded when an identical WAV exists in
+`archive-vibrato-valid/`.
+
+Known holes are explicit in the manifest: the Flex set currently has Retune
+0 and 10 ms (not the planned 25 ms); Natural Vibrato has no confirmed 0-ms
+baseline and no valid +9-ms copy.  Do not fit a curve through either hole.
+
+## Planned bounce matrix
 
 Put the rendered Artist WAVs in `artist-renders/` using these names:
 
@@ -25,7 +44,7 @@ Put the rendered Artist WAVs in `artist-renders/` using these names:
 | --- | --- | --- | --- |
 | Flex-Tune | every `flex_*.wav` | 0, 25, 50, 75, 100 at Retune 0 and 25 ms | `_artist_flexNN_retuneNN.wav` |
 | Humanize | every `humanize_*.wav` | 0, 25, 50, 75, 100 | `_artist_humanizeNN.wav` |
-| Natural Vibrato | every `natural_vibrato_*.wav` | 0, 25, 50, 75, 100 | `_artist_naturalvibratoNN.wav` |
+| Natural Vibrato | every `natural_vibrato_*.wav` | the plug-in's actual -12…+12 ms positions | `_artist_naturalvibratoNN.wav` |
 
 Example: `flex_fs4_plus30ct_3s_artist_flex50_retune25.wav`.
 

@@ -1,0 +1,17 @@
+parameter_binding,ui/apvts/dsp,module
+Voice,Alto/1/Alto,YIN profile
+Key,F#/6/6,target selector
+Scale,Natural Minor/2/2,note policy
+Transpose,0 st/0/0,trajectory
+Reference,440 Hz/440/440,Hz-note mapping
+Tracking,50%/50/50,YIN gate
+Retune,0 ms/0/0,trajectory
+Flex-Tune,0/0/0,trajectory
+Humanize,0%/0/0,trajectory
+Natural Vibrato,0 ms/0/0,trajectory
+Group Octaves,state/state,state,note policy
+Note Map Rules,state/state,state,target selector
+full_default,target_commits=31,dry_bridges=0,max_trajectory_step_ct=108,max_renderer_step_ct=72
+csv=/Users/hiimdrdey/autotune/renders/baseline-preview-telemetry/full_default_intervals.csv
+events=/Users/hiimdrdey/autotune/renders/baseline-preview-telemetry/full_default_events.csv
+render=/Users/hiimdrdey/autotune/renders/baseline-preview-telemetry/full_default_render.wav
