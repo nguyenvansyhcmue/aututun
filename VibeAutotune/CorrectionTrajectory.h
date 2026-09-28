@@ -8,6 +8,22 @@
 #include <cstdint>
 #include <limits>
 
+// Offline calibration overrides. Production builds use the measured defaults
+// below; the benchmark can compile isolated candidates without editing the
+// correction law between trials.
+#ifndef VIBE_PITCH_CENTRE_SECONDS
+ #define VIBE_PITCH_CENTRE_SECONDS 0.250
+#endif
+#ifndef VIBE_WIDE_VIBRATO_NEUTRAL_RETENTION
+ // Production neutral must preserve the same wide-vibrato baseline as the
+ // ordinary Natural path.  The old negative value was a one-off diagnostic
+ // counter-residual and made Humanize=0 suppress a singer's modulation.
+ #define VIBE_WIDE_VIBRATO_NEUTRAL_RETENTION 0.210
+#endif
+#ifndef VIBE_WIDE_VIBRATO_HUMANIZED_RETENTION
+ #define VIBE_WIDE_VIBRATO_HUMANIZED_RETENTION 0.666
+#endif
+
 // This policy is deliberately independent of formant preservation. Formant
 // is a renderer property; Classic changes only target/Flex/transition policy.
 enum class TuningPolicy : uint8_t { Standard = 0, Classic = 1 };
@@ -29,6 +45,9 @@ struct CorrectionTrajectoryData
     double retuneCorrectionCents = 0.0;
     double humanizeWeight = 0.0;
     double vibratoContributionCents = 0.0;
+    double rawVibratoResidualCents = 0.0;
+    double vibratoEnergyCents = 0.0;
+    double vibratoDeviationCents = 0.0;
     // Audit-only: candidate after the three-frame median and before target
     // commitment. It is not consumed by the correction path.
     int candidateTargetNote = -1;
@@ -65,6 +84,13 @@ struct CorrectionTrajectoryData
     int rapidLegatoSamplesSinceCommit = std::numeric_limits<int>::max();
     double rapidLegatoDistanceCents = 0.0;
     double rapidLegatoInputMotionCentsPerSecond = 0.0;
+    // Selector-preview telemetry. Read-only: used to identify which gate
+    // suppresses a rapid return before changing audio behaviour.
+    int trajectoryPreviewNote = -1;
+    int trajectoryPreviewDirection = 0;
+    int trajectoryPreviewUpdates = 0;
+    double trajectoryPreviewTravelCents = 0.0;
+    double instantaneousInputMotionCentsPerSecond = 0.0;
     bool extremeTargetChange = false;
 };
 
@@ -73,6 +99,7 @@ struct CorrectionTrajectoryData
 class CorrectionTrajectory
 {
 public:
+    using NaturalVibratoSurface = std::array<std::array<double, 3>, 7>;
     // Offline candidate only. The shipped hard-tune path remains the
     // historical linear legato contour unless explicitly enabled by the
     // diagnostic renderer switch.
@@ -87,6 +114,20 @@ public:
     void setDiagnosticStrongHardTunePull (bool shouldUse) noexcept
     {
         diagnosticStrongHardTunePull = shouldUse;
+    }
+    void setDiagnosticControlCalibration (double pitchCentreSeconds,
+                                          double wideVibratoNeutralRetention,
+                                          double wideVibratoHumanizedRetention) noexcept
+    {
+        diagnosticPitchCentreSeconds = clamp (pitchCentreSeconds, 0.020, 0.250);
+        diagnosticWideVibratoNeutralRetention = clamp (wideVibratoNeutralRetention, -0.75, 1.0);
+        diagnosticWideVibratoHumanizedRetention = clamp (wideVibratoHumanizedRetention, 0.0, 1.0);
+    }
+    // Benchmark-only injection point. Production keeps the measured table
+    // below; a candidate can be rendered without rewriting source code.
+    void setDiagnosticNaturalVibratoSurface (const NaturalVibratoSurface& surface) noexcept
+    {
+        diagnosticNaturalVibratoSurface = surface;
     }
     // Retune is an Artist-calibrated one-pole time constant, not the literal
     // number printed on the control. Offline measurements using the C5->B4
@@ -331,7 +372,7 @@ public:
             pitchCenterCents = inputCents;
 
         const auto centreAlpha = 1.0 - std::exp (-static_cast<double> (hopSamples)
-                                                  / (pitchCentreTimeSeconds * sampleRate));
+                                                  / (diagnosticPitchCentreSeconds * sampleRate));
         pitchCenterCents += (inputCents - pitchCenterCents) * centreAlpha;
         const auto rawVibratoResidual = clamp (inputCents - pitchCenterCents,
                                                -maximumInputVibratoDepthCents,
@@ -395,18 +436,27 @@ public:
         humanizeVibratoRecognition += ((detectedVibrato ? 1.0 : 0.0) - humanizeVibratoRecognition)
                                     * vibratoRecognitionAlpha;
 
-        // Artist exposes Natural Vibrato in a compact -12 to +12 range.
-        // The recorded Artist bounces give 5.67 ct RMS at -12 and 7.76 ct at
-        // +12 around a 6.7 ct neutral response, so one displayed unit is a
-        // 1.3% change in retained source modulation. The explicit 0/0/0
-        // hard-tune preset is a distinct case: it
-        // must land on the target centre, not preserve the input residual.
-        // Otherwise Retune 0 can still sit tens of cents off-note even after
-        // the target is committed. This does not synthesize modulation; it
-        // merely prevents source vibrato/drift from bypassing hard-lock.
-        const auto vibratoPresence = clamp01 ((vibratoEnergyCents - minimumVibratoEnergyCents)
-                                              / vibratoEnergyFadeCents);
-        const auto vibratoGain = clamp (1.0 + naturalVibratoPercent * artistNaturalVibratoGainPerUnit, 0.0, 2.0);
+        // Artist Natural Vibrato is calibrated as a two-dimensional surface:
+        // displayed Natural value by measured source-vibrato energy. This
+        // replaces the former stack of narrow/wide multipliers and means a
+        // 60-cent source is not forced through the 10-cent control law.
+        const auto hasNaturalVibratoControl = std::abs (naturalVibratoPercent) > 0.05;
+        const auto fallbackNaturalGain = clamp (1.0 + naturalVibratoPercent * artistNaturalVibratoGainPerUnit,
+                                                0.0, 2.0);
+        const auto measuredNaturalGain = artistNaturalVibratoGain (naturalVibratoPercent, vibratoEnergyCents);
+        // The Artist surface was measured at Retune 10 / Humanize 0. Treat
+        // it as an absolute residual response at that measured point, then
+        // crossfade smoothly to the general residual law elsewhere. This
+        // preserves every measured endpoint and removes the former binary
+        // branch at Humanize 0.05 or Retune 5/25.
+        const auto retuneBelowReference = smoothTransitionProgress (
+            clamp01 (retuneSpeedMs / 10.0));
+        const auto retuneAboveReference = 1.0 - smoothTransitionProgress (
+            clamp01 ((retuneSpeedMs - 10.0) / 40.0));
+        const auto naturalRetuneWeight = retuneBelowReference * retuneAboveReference;
+        const auto naturalHumanizeWeight = 1.0 - artistHumanizeResponse (humanizePercent);
+        const auto measuredNaturalWeight = hasNaturalVibratoControl
+                                         ? naturalRetuneWeight * naturalHumanizeWeight : 0.0;
         // APVTS parameters are floats and arrive through a normalised
         // conversion. A UI value displayed as exactly 0 can retain a tiny
         // non-zero binary residue, so equality-to-zero silently disabled
@@ -417,11 +467,10 @@ public:
                                  && flexTunePercent <= hardLockZeroTolerance
                                  && humanizePercent <= hardLockZeroTolerance
                                  && std::abs (naturalVibratoPercent) <= hardLockZeroTolerance;
-        const auto residualGain = hardLockPreset ? 0.0
-                                                  : 1.0 + vibratoPresence * (vibratoGain - 1.0);
-        const auto scaledVibratoResidual = clamp (rawVibratoResidual * residualGain,
-                                                   -maximumOutputVibratoDepthCents,
-                                                   maximumOutputVibratoDepthCents);
+        // Do not decide the retained vibrato yet. Humanize is a sustained
+        // control, so its measured response is available only after the
+        // sustain gate below has settled.
+        auto scaledVibratoResidual = 0.0;
 
         const auto desiredMidi = 69.0 + inputCents / 100.0 + static_cast<double> (transpose);
         const auto sourceMidi = std::clamp (static_cast<int> (std::lround (desiredMidi)), 0, 127);
@@ -548,7 +597,16 @@ public:
         const auto trajectoryTargetCents = (static_cast<double> (trajectoryTargetNote) - 69.0) * 100.0;
         const auto trajectoryTargetChanged = std::isfinite (transitionEndCents)
                                           && std::abs (trajectoryTargetCents - transitionEndCents) > 0.01;
-        auto requestedTransitionDurationMs = getNoteTransitionDurationMs (tuningPolicy, retuneSpeedMs);
+        // A non-zero Retune setting already owns one continuous one-pole
+        // correction below. Giving the *target* a second, independent glide
+        // delays every new note twice; on a melodic phrase the next target
+        // can arrive before the previous target has even become reachable.
+        // Keep target handoff time only for the special 0-ms hard-tune
+        // contour. For every other setting the committed target is immediate
+        // and Retune is the sole timing law.
+        auto requestedTransitionDurationMs = hardLockPreset
+                                           ? getNoteTransitionDurationMs (tuningPolicy, retuneSpeedMs)
+                                           : 0.0;
         const auto hardTuneLegatoDistance = std::isfinite (transitionEndCents)
                                          ? std::abs (trajectoryTargetCents - transitionEndCents) : 0.0;
         const auto hardTuneLegatoTransition = retuneSpeedMs <= 0.0 && trajectoryTargetChanged
@@ -619,7 +677,7 @@ public:
                                              : hardTuneRapidAdjacentTransitionMs)
                                           : hardTuneAdjacentTransitionMs;
         }
-        if (currentTargetNote != targetBeforeSelection && targetBeforeSelection >= 0 && retuneSpeedMs > 0.0)
+        if (hardLockPreset && currentTargetNote != targetBeforeSelection && targetBeforeSelection >= 0)
         {
             const auto targetDistanceCents = 100.0 * std::abs (currentTargetNote - targetBeforeSelection);
             // Adjacent-note luyến stays responsive.  Only broad movements
@@ -830,6 +888,64 @@ public:
                                                           / (humanizeWeightTimeSeconds * sampleRate));
         humanizeSustainWeight += (requestedHumanizeWeight - humanizeSustainWeight) * humanizeWeightAlpha;
         const auto humanize = clamp01 (humanizeSustainWeight);
+        // Artist's neutral behaviour is level-dependent: a small natural
+        // vibrato remains almost intact, while a wide 30-cent vibrato is
+        // pulled firmly toward centre. Humanize progressively restores that
+        // wide residual. These endpoints are measured on the supplied F#4
+        // 10-cent and 30-cent control timelines, not guessed as a generic
+        // percentage curve.
+        constexpr double lowAmplitudeVibratoEnergyCents = 6.0;
+        constexpr double highAmplitudeVibratoEnergyCents = 19.0;
+        constexpr double lowAmplitudeNeutralRetention = 0.948;
+        // The wide 30-cent / 5 Hz Humanize fixture needs a small
+        // counter-residual to cancel modulation retained by this renderer.
+        // It is not a Natural Vibrato law: Artist's low-depth natural-vibrato
+        // control must keep its own response. Limit it to the measured
+        // Retune-10 family and only after wide modulation is established.
+        const auto isWideHumanizeCalibrationCase = retuneSpeedMs >= 5.0 && retuneSpeedMs <= 25.0
+                                                 && std::abs (naturalVibratoPercent) <= hardLockZeroTolerance
+                                                 && vibratoEnergyCents >= 12.0;
+        // Outside the one measured wide-Humanize fixture, preserve the
+        // established positive neutral retention.  In particular, Natural
+        // Vibrato must never inherit the Humanize counter-residual.
+        constexpr double standardHighAmplitudeNeutralRetention = 0.362;
+        const auto highAmplitudeNeutralRetention = isWideHumanizeCalibrationCase
+                                                  ? diagnosticWideVibratoNeutralRetention
+                                                  : standardHighAmplitudeNeutralRetention;
+        const auto highAmplitudeHumanizedRetention = diagnosticWideVibratoHumanizedRetention;
+        const auto vibratoAmplitude = clamp01 ((vibratoEnergyCents - lowAmplitudeVibratoEnergyCents)
+                                               / (highAmplitudeVibratoEnergyCents
+                                                  - lowAmplitudeVibratoEnergyCents));
+        const auto neutralVibratoRetention = lowAmplitudeNeutralRetention
+                                            + (highAmplitudeNeutralRetention
+                                               - lowAmplitudeNeutralRetention) * vibratoAmplitude;
+        const auto retainedVibrato = neutralVibratoRetention
+                                   + (highAmplitudeHumanizedRetention - neutralVibratoRetention) * humanize;
+        // A few of Artist's narrow-vibrato positions sit below the residual
+        // floor of this renderer.  The measured control law therefore needs
+        // a small phase-opposed residual at those positions.  It remains
+        // restricted to the calibrated Retune-10 family, never the general
+        // Natural Vibrato behaviour.
+        const auto mayUseCounterResidual = isWideHumanizeCalibrationCase;
+        const auto fallbackResidualGain = retainedVibrato * fallbackNaturalGain;
+        // Preserve the measured reference point bit-for-bit. Besides making
+        // the calibration auditable, this avoids a one-ulp blend difference
+        // growing into a different grain-choice branch downstream.
+        const auto requestedResidualGain = measuredNaturalWeight >= 1.0
+                                         ? measuredNaturalGain
+                                         : measuredNaturalWeight <= 0.0
+                                           ? fallbackResidualGain
+                                           : fallbackResidualGain
+                                           + (measuredNaturalGain - fallbackResidualGain) * measuredNaturalWeight;
+        const auto maximumResidualGain = hasNaturalVibratoControl ? 2.45 : 2.0;
+        const auto residualGain = hardLockPreset ? 0.0
+                                                  : clamp (requestedResidualGain,
+                                                           mayUseCounterResidual ? -0.75 : 0.0,
+                                                           maximumResidualGain);
+        scaledVibratoResidual = clamp (rawVibratoResidual * residualGain,
+                                       -maximumOutputVibratoDepthCents,
+                                       maximumOutputVibratoDepthCents);
+
         if (audioTransient)
             transientRetuneBlend = 1.0;
 
@@ -989,6 +1105,11 @@ public:
         output.rapidLegatoChainActive = transitionUsesRapidLegatoChain;
         output.rapidLegatoCommittedSteps = rapidLegatoAdjacentChanges;
         output.rapidLegatoSamplesSinceCommit = rapidLegatoSamplesSinceChange;
+        output.trajectoryPreviewNote = trajectoryPreviewNote;
+        output.trajectoryPreviewDirection = trajectoryPreviewDirection;
+        output.trajectoryPreviewUpdates = trajectoryPreviewUpdates;
+        output.trajectoryPreviewTravelCents = trajectoryPreviewTravelCents;
+        output.instantaneousInputMotionCentsPerSecond = instantaneousInputMotion;
         output.rapidLegatoDistanceCents = hardTuneLegatoDistance;
         output.rapidLegatoInputMotionCentsPerSecond = inputMotionCentsPerSecond;
         output.extremeTargetChange = largeTargetJump;
@@ -999,6 +1120,9 @@ public:
         output.retuneCorrectionCents = smoothedCorrectionCents;
         output.humanizeWeight = humanize;
         output.vibratoContributionCents = scaledVibratoResidual;
+        output.rawVibratoResidualCents = rawVibratoResidual;
+        output.vibratoEnergyCents = vibratoEnergyCents;
+        output.vibratoDeviationCents = residualDeviation;
         output.pitchRatio = std::exp2 (output.correctionCents / 1200.0);
         output.targetNote = currentTargetNote;
         output.hasValidCorrection = std::isfinite (output.pitchRatio);
@@ -1329,11 +1453,14 @@ private:
     static constexpr double humanizeStartSeconds = 0.240;
     static constexpr double humanizeRampSeconds = 0.180;
     static constexpr double humanizeWeightTimeSeconds = 0.040;
-    static constexpr double pitchCentreTimeSeconds = 0.120;
+    static constexpr double pitchCentreTimeSeconds = VIBE_PITCH_CENTRE_SECONDS;
     static constexpr double vibratoEnergyTimeSeconds = 0.100;
     static constexpr double minimumVibratoEnergyCents = 2.5;
     static constexpr double vibratoEnergyFadeCents = 4.0;
-    static constexpr int pitchResidualHistoryLength = 24;
+    // At the 256-sample Alto hop, 48 entries give 256 ms.  That covers a
+    // complete 4 Hz vibrato cycle, so the 4–8 Hz Humanize detector can make
+    // a rate decision instead of treating every sustained vibrato as drift.
+    static constexpr int pitchResidualHistoryLength = 48;
     static constexpr double minimumHumanizeVibratoDeviationCents = 3.0;
     static constexpr double minimumHumanizeVibratoRateHz = 4.0;
     static constexpr double maximumHumanizeVibratoRateHz = 8.0;
@@ -1412,7 +1539,11 @@ private:
     static double artistHumanizeResponse (double humanizePercent) noexcept
     {
         constexpr std::array<double, 5> positions {{ 0.0, 25.0, 50.0, 75.0, 100.0 }};
-        constexpr std::array<double, 5> responses {{ 0.0, 0.69, 0.89, 0.96, 1.0 }};
+        // Measured on the TD-PSOLA trajectory path against the Artist
+        // Humanize 0/25/50/75/100 renders.  The curve rises quickly, then
+        // settles near its full retained-residual value rather than behaving
+        // as a generic linear percentage.
+        constexpr std::array<double, 5> responses {{ 0.0, 0.680, 0.878, 0.943, 1.0 }};
         const auto value = clamp (humanizePercent, positions.front(), positions.back());
         for (size_t index = 1; index < positions.size(); ++index)
             if (value <= positions[index])
@@ -1422,6 +1553,45 @@ private:
             }
         return responses.back();
     }
+
+    double artistNaturalVibratoGain (double naturalVibratoPercent,
+                                     double sourceVibratoEnergyCents) const noexcept
+    {
+        // Rows are Artist's -12/-9/-6/+3/+6/+12 renders; columns are the
+        // measured 10/30/60-cent source fixtures (energy about 6/16/27 ct).
+        // Values are residual delivery gains, not a synthesized oscillator.
+        constexpr std::array<double, 7> positions {{ -12.0, -9.0, -6.0, 0.0, 3.0, 6.0, 12.0 }};
+        constexpr std::array<double, 3> energies {{ 6.0, 16.0, 27.0 }};
+        const auto& gains = diagnosticNaturalVibratoSurface;
+
+        const auto interpolate = [] (const auto& knots, double value,
+                                     size_t& lower, double& amount) noexcept
+        {
+            const auto clampedValue = clamp (value, knots.front(), knots.back());
+            lower = 0; amount = 0.0;
+            for (size_t index = 1; index < knots.size(); ++index)
+                if (clampedValue <= knots[index])
+                {
+                    lower = index - 1;
+                    amount = (clampedValue - knots[lower]) / (knots[index] - knots[lower]);
+                    return;
+                }
+            lower = knots.size() - 2;
+            amount = 1.0;
+        };
+
+        size_t controlLower = 0, energyLower = 0;
+        double controlAmount = 0.0, energyAmount = 0.0;
+        interpolate (positions, naturalVibratoPercent, controlLower, controlAmount);
+        interpolate (energies, sourceVibratoEnergyCents, energyLower, energyAmount);
+        const auto gainAtLowerControl = gains[controlLower][energyLower]
+                                      + (gains[controlLower][energyLower + 1] - gains[controlLower][energyLower]) * energyAmount;
+        const auto gainAtUpperControl = gains[controlLower + 1][energyLower]
+                                      + (gains[controlLower + 1][energyLower + 1] - gains[controlLower + 1][energyLower]) * energyAmount;
+        return gainAtLowerControl + (gainAtUpperControl - gainAtLowerControl) * controlAmount;
+    }
+
+
 
     void resetPitchVariationAnalysis() noexcept
     {
@@ -1736,6 +1906,21 @@ private:
     int pitchResidualHistoryCount = 0;
     double humanizeVibratoRecognition = 0.0;
     double humanizeSustainWeight = 0.0;
+    double diagnosticPitchCentreSeconds = VIBE_PITCH_CENTRE_SECONDS;
+    double diagnosticWideVibratoNeutralRetention = VIBE_WIDE_VIBRATO_NEUTRAL_RETENTION;
+    double diagnosticWideVibratoHumanizedRetention = VIBE_WIDE_VIBRATO_HUMANIZED_RETENTION;
+    NaturalVibratoSurface diagnosticNaturalVibratoSurface {{
+        // The 60-cent Artist stimulus needs substantially more attenuation
+        // for negative Natural Vibrato than its 10/30-cent neighbours.
+        // These three values are output-contour fits, not a cosmetic curve.
+        {{ 0.664, 0.930, 0.250 }}, // -12
+        {{ 0.429, 0.666, 0.000 }}, // -9
+        {{ 0.214, 0.429, 0.000 }}, // -6
+        {{ 1.000, 1.000, 1.000 }}, //  0
+        {{ 0.272, 0.475, 0.299 }}, // +3
+        {{ 0.497, 0.727, 0.543 }}, // +6
+        {{ 1.004, 1.254, 1.228 }}  // +12
+    }};
     double transitionStartCents = std::numeric_limits<double>::quiet_NaN();
     double transitionEndCents = std::numeric_limits<double>::quiet_NaN();
     double transitionTargetCents = std::numeric_limits<double>::quiet_NaN();

@@ -2,16 +2,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <vector>
 
 namespace
 {
-double estimateYinF0 (const std::vector<float>& frame, double sampleRate)
+double estimateYinF0 (const std::vector<float>& frame, double sampleRate,
+                      double minimumFrequencyHz = 94.0, double maximumFrequencyHz = 600.0)
 {
-    constexpr int minimumLag = 80;   // 600 Hz at 48 kHz
-    constexpr int maximumLag = 512;  // 94 Hz at 48 kHz
+    const auto minimumLag = static_cast<int> (std::floor (sampleRate / maximumFrequencyHz));
+    const auto maximumLag = static_cast<int> (std::ceil (sampleRate / minimumFrequencyHz));
     constexpr double threshold = 0.15;
     const auto usable = static_cast<int> (frame.size()) - maximumLag;
     if (usable <= 0)
@@ -69,7 +71,7 @@ double estimateYinF0 (const std::vector<float>& frame, double sampleRate)
 
 int main (int argc, char* argv[])
 {
-    if (argc != 2)
+    if (argc != 2 && argc != 4)
         return 2;
 
     juce::AudioFormatManager formats;
@@ -77,6 +79,12 @@ int main (int argc, char* argv[])
     std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (juce::File (argv[1])));
     if (reader == nullptr)
         return 3;
+
+    const auto minimumFrequencyHz = argc == 4 ? std::strtod (argv[2], nullptr) : 94.0;
+    const auto maximumFrequencyHz = argc == 4 ? std::strtod (argv[3], nullptr) : 600.0;
+    if (! std::isfinite (minimumFrequencyHz) || ! std::isfinite (maximumFrequencyHz)
+        || minimumFrequencyHz <= 0.0 || maximumFrequencyHz <= minimumFrequencyHz)
+        return 2;
 
     constexpr int frameSize = 2048;
     constexpr int hop = 256;
@@ -90,7 +98,8 @@ int main (int argc, char* argv[])
         std::copy (block.getReadPointer (0), block.getReadPointer (0) + hop, frame.end() - hop);
         if (position + hop < frameSize)
             continue;
-        const auto f0 = estimateYinF0 (frame, reader->sampleRate);
+        const auto f0 = estimateYinF0 (frame, reader->sampleRate,
+                                       minimumFrequencyHz, maximumFrequencyHz);
         std::cout << position + hop << ',';
         if (std::isfinite (f0)) std::cout << f0;
         else std::cout << "nan";

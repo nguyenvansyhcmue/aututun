@@ -50,9 +50,9 @@ struct Stats
 
 int main (int argc, char* argv[])
 {
-    if (argc < 2 || argc > 7)
+    if (argc < 2 || argc > 12)
     {
-        std::cerr << "usage: VibeAutotuneVocalDiagnostic <mono-or-stereo-wav> [retune-ms] [output-wav] [flex] [humanize] [natural-vibrato-ms]\n";
+        std::cerr << "usage: VibeAutotuneVocalDiagnostic <mono-or-stereo-wav> [retune-ms] [output-wav] [flex] [humanize] [natural-vibrato-ms] [pitch-centre-s] [wide-vibrato-neutral] [wide-vibrato-humanized] [phase-continuous-renderer] [stable-target-follows-trajectory]\n";
         return 2;
     }
 
@@ -78,6 +78,15 @@ int main (int argc, char* argv[])
     setParameter (processor, "flexTune", flexTune);
     setParameter (processor, "humanize", humanize);
     setParameter (processor, "naturalVibrato", naturalVibrato);
+    if (argc >= 10)
+        processor.setControlCalibrationDiagnostic (std::atof (argv[7]), std::atof (argv[8]), std::atof (argv[9]));
+    if (argc >= 11)
+    {
+        CausalTDPSOLARenderer::DiagnosticAblation ablation;
+        ablation.phaseContinuousRenderer = std::atoi (argv[10]) != 0;
+        ablation.stableTargetFollowsTrajectory = argc >= 12 && std::atoi (argv[11]) != 0;
+        processor.setRendererDiagnosticAblation (ablation);
+    }
     setParameter (processor, "tracking", 50.0f);
     setParameter (processor, "transpose", 0.0f);
     setParameter (processor, "referencePitch", 440.0f);

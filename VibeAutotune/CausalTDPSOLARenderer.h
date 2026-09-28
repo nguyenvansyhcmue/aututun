@@ -32,6 +32,11 @@ public:
         // note/ratio automation without changing tracker state.
         bool phaseForceUnityRatio = false;
         bool phaseForceStaticUpRatio = false;
+        // Offline A/B: once a committed note has been stable long enough,
+        // let the synthesis lattice follow the trajectory residual.  This
+        // keeps Humanize/Natural-Vibrato audible while target changes still
+        // use the note-owned cadence for a crisp handoff.
+        bool stableTargetFollowsTrajectory = true;
     };
 
     void setDiagnosticAblation (DiagnosticAblation value) noexcept { diagnosticAblation = value; }
@@ -234,7 +239,8 @@ public:
 
     void process (const float* source, float* destination, int samples,
                   double f0Hz, double requestedRatio, bool voiced, bool forceDry = false,
-                  double committedTargetHz = std::numeric_limits<double>::quiet_NaN()) noexcept
+                  double committedTargetHz = std::numeric_limits<double>::quiet_NaN(),
+                  double targetResidualCents = 0.0) noexcept
     {
         if (source == nullptr || destination == nullptr || samples <= 0 || samples > maximumBlock)
             return;
@@ -333,7 +339,26 @@ public:
             hasTargetBeforePreviousHz = false;
             pendingSynthesisMark = -1.0;
         }
-        const auto synthesisFrequency = targetIsUsable ? committedTargetHz : f0Hz * smoothedRatio;
+        constexpr double stableTargetTrajectoryDelaySeconds = 0.120;
+        const auto targetHasSettled = targetIsUsable
+                                   && absoluteSample >= previousTargetCommitSample
+                                   && absoluteSample - previousTargetCommitSample
+                                      >= static_cast<uint64_t> (std::lround (stableTargetTrajectoryDelaySeconds * sampleRate));
+        const auto residualRatio = std::exp2 (std::clamp (targetResidualCents, -120.0, 120.0) / 1200.0);
+        // requestedRatio contains both base correction and the intentional
+        // Humanize/Natural-Vibrato residual.  Only snap the lattice to the
+        // committed note after the *base* path has arrived. This preserves a
+        // slow Retune move, while avoiding cancellation of a residual on a
+        // held note (source F0 * total ratio would otherwise remove it).
+        const auto trajectoryFrequency = f0Hz * smoothedRatio;
+        const auto baseTrajectoryFrequency = trajectoryFrequency / residualRatio;
+        const auto baseCorrectionSettled = targetHasSettled
+                                        && std::abs (1200.0 * std::log2 (baseTrajectoryFrequency / committedTargetHz)) <= 2.0;
+        const auto synthesisFrequency = targetIsUsable
+                                     && (! diagnosticAblation.stableTargetFollowsTrajectory || baseCorrectionSettled)
+                                     ? committedTargetHz * (diagnosticAblation.stableTargetFollowsTrajectory
+                                                                 ? residualRatio : 1.0)
+                                     : trajectoryFrequency;
         const auto samplesToNextBefore = valid ? (1.0 - synthPhase) * sampleRate / synthesisFrequency : -1.0;
         if (strongRatioStep)
         {
@@ -607,8 +632,11 @@ public:
             // A committed note owns synthesis cadence. Source F0/ratio still
             // choose the grain sequence, but cannot bend the output lattice
             // away from this note between adjacent grains.
-            const auto activeSynthesisFrequency = targetIsUsable ? committedTargetHz
-                                                                  : f0Hz * smoothedRatio;
+            const auto activeSynthesisFrequency = targetIsUsable
+                                                 && (! diagnosticAblation.stableTargetFollowsTrajectory || baseCorrectionSettled)
+                                                 ? committedTargetHz * (diagnosticAblation.stableTargetFollowsTrajectory
+                                                                            ? residualRatio : 1.0)
+                                                 : trajectoryFrequency;
             synthPhase += activeSynthesisFrequency / sampleRate;
             if (sourcePhase >= 1.0)
             {

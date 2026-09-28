@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace
@@ -164,6 +165,64 @@ double estimateRenderedF0Yin (const juce::AudioBuffer<float>& audio, int centre,
     return sampleRate / refinedLag;
 }
 
+// Match IndependentPitchContour exactly: its causal 2048-sample analysis
+// frame is also the extractor used for the captured Artist control grid.
+// Do not substitute the shorter centred forensic probe above for scoring.
+double estimateControlGridF0 (const juce::AudioBuffer<float>& audio, int endSample, double sampleRate)
+{
+    constexpr int frameLength = 2048;
+    constexpr double minimumFrequencyHz = 94.0;
+    constexpr double maximumFrequencyHz = 600.0;
+    constexpr double threshold = 0.15;
+    if (endSample < frameLength || endSample > audio.getNumSamples())
+        return std::numeric_limits<double>::quiet_NaN();
+
+    const auto* samples = audio.getReadPointer (0) + endSample - frameLength;
+    const auto minimumLag = static_cast<int> (std::floor (sampleRate / maximumFrequencyHz));
+    const auto maximumLag = static_cast<int> (std::ceil (sampleRate / minimumFrequencyHz));
+    const auto usable = frameLength - maximumLag;
+    auto energy = 0.0;
+    for (int index = 0; index < usable; ++index)
+        energy += static_cast<double> (samples[index]) * samples[index];
+    if (energy / usable < 1.0e-7)
+        return std::numeric_limits<double>::quiet_NaN();
+
+    std::array<double, 512> difference {};
+    for (int lag = 1; lag <= maximumLag; ++lag)
+        for (int index = 0; index < usable; ++index)
+        {
+            const auto delta = static_cast<double> (samples[index]) - samples[index + lag];
+            difference[static_cast<size_t> (lag)] += delta * delta;
+        }
+
+    auto cumulative = 0.0;
+    auto bestValue = std::numeric_limits<double>::infinity();
+    auto bestLag = minimumLag;
+    auto chosenLag = -1;
+    for (int lag = 1; lag <= maximumLag; ++lag)
+    {
+        cumulative += difference[static_cast<size_t> (lag)];
+        if (lag < minimumLag || cumulative <= 1.0e-12)
+            continue;
+        const auto cmnd = difference[static_cast<size_t> (lag)] * lag / cumulative;
+        if (cmnd < bestValue) { bestValue = cmnd; bestLag = lag; }
+        if (cmnd < threshold && lag < maximumLag
+            && difference[static_cast<size_t> (lag)] <= difference[static_cast<size_t> (lag + 1)])
+        { chosenLag = lag; break; }
+    }
+    const auto lag = chosenLag >= 0 ? chosenLag : bestLag;
+    if (lag <= minimumLag || lag >= maximumLag)
+        return std::numeric_limits<double>::quiet_NaN();
+    const auto denominator = difference[static_cast<size_t> (lag - 1)]
+                           - 2.0 * difference[static_cast<size_t> (lag)]
+                           + difference[static_cast<size_t> (lag + 1)];
+    const auto fractional = std::abs (denominator) > 1.0e-12
+                          ? std::clamp (0.5 * (difference[static_cast<size_t> (lag - 1)]
+                                             - difference[static_cast<size_t> (lag + 1)]) / denominator, -0.5, 0.5)
+                          : 0.0;
+    return sampleRate / (lag + fractional);
+}
+
 bool writeWav (const juce::File& file, const juce::AudioBuffer<float>& audio, double sampleRate)
 {
     std::unique_ptr<juce::FileOutputStream> stream (file.createOutputStream());
@@ -190,9 +249,35 @@ void setParameter (VibeAutotuneProcessor& processor, const char* id, float value
         parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
 }
 
+bool loadNaturalVibratoSurface (const juce::File& file,
+                                CorrectionTrajectory::NaturalVibratoSurface& surface)
+{
+    std::ifstream stream (file.getFullPathName().toStdString());
+    if (! stream)
+        return false;
+
+    std::vector<double> values;
+    std::string token;
+    while (std::getline (stream, token, ','))
+    {
+        std::stringstream parser (token);
+        double value = 0.0;
+        while (parser >> value)
+            values.push_back (value);
+    }
+    if (values.size() != 21)
+        return false;
+
+    size_t index = 0;
+    for (auto& row : surface)
+        for (auto& value : row)
+            value = values[index++];
+    return true;
+}
+
 void writeHeader (std::ofstream& csv)
 {
-    csv << "sampleIndex,timeMs,voiceRangeMin,voiceRangeMax,trackingValue,voiced,pitchConfidence,rawF0,stableF0,rawMidi,key,scale,committedTargetMidi,targetChanged,flexWeight,desiredCorrectionCents,retuneCorrectionCents,humanizeWeight,vibratoContributionCents,requestedRendererRatio,rendererPreGuardCorrectionCents,rendererPostGuardCorrectionCents,rendererCorrectionSource,deliveredRendererCorrectionCents,rendererInputCorrectionCents,rendererStepCents,correctionIsActive,targetBridge,transientBridge,dryWetMix,transpose,referenceHz,currentTargetCents,candidateTargetCents,trajectoryTransitionActive,trajectoryTransitionProgress,trajectoryTransitionStartCents,trajectoryTransitionEndCents,trajectoryTransitionDurationMs,trajectoryRapidAdjacentContour,trajectoryRendererCrossingActive,targetDecisionMidpointCents,targetDecisionExcessCents,targetHysteresisCents,pendingTargetMidi,pendingTargetFrames,targetDecisionBeyondHysteresis,rapidAdjacentRawCandidate,rapidLegatoAdjacentStep,rapidLegatoHardLock,rapidLegatoTargetChanged,rapidLegatoContinuesDirection,rapidLegatoChainStarts,rapidLegatoChainActive,rapidLegatoCommittedSteps,rapidLegatoSamplesSinceCommit,rapidLegatoDistanceCents,rapidLegatoInputMotionCentsPerSecond,latticeReset,dryGuardActive,reentryHoldActive,sourceControlTimestamp,sourceControlF0Hz,sourceControlTargetCents,sourceControlTargetMidi,sourceControlValid,sourceControlHoldDry,sourceControlPitchRatio,olaOverlapWeight,olaAudibleRatioAtStart,olaAudibleGrainAge,olaAudibleReadPosition,olaDominantGrainWeight,olaDominantGrainEpoch,olaDominantGrainRatio,olaDominantGrainExpectedF0,olaDominantGrainTargetMidi,olaDominantGrainTargetEventId,olaDominantGrainTargetControlTimestamp,olaTargetCandidateWeight,olaTargetCandidateEpoch,olaTargetCandidateExpectedF0,olaShadowFutureSegments,olaShadowAudibleSegments,olaShadowFutureSamples,olaShadowReplacementEligible,olaShadowReplacementFirstSample,olaShadowReplacementLastSample,olaShadowCandidateRenderApplied,nextEpochBeforeReversal,nextEpochAfterReversal,actualSpawnEpoch,ratioAtSpawn,spawnTargetMidi,spawnTargetEventId,spawnTargetControlTimestamp,spawnSourceMarkF0,spawnExpectedF0,olaSourceMarkTime,olaSourceMarkF0,olaExpectedGrainF0,synthExpectedPeriod,synthActualPeriod,synthPeriodError,synthSourceSpacing,sourceSelectionCursor,newestCompleteSourceMark,sibilanceResidualMix,rendererHighFrequencyEvidence,rendererPeriodicCoherence,pitchMarkCandidateOffset,pitchMarkCandidateCorrelation,confirmedPitchMarkOffset,confirmedPitchMarkRun,rendererArtifactDryVeto,rendererGrainStarved,rendererShouldRenderWet,rendererSafetyDrySamples\n";
+    csv << "sampleIndex,timeMs,voiceRangeMin,voiceRangeMax,trackingValue,voiced,pitchConfidence,rawF0,stableF0,rawMidi,key,scale,committedTargetMidi,targetChanged,flexWeight,desiredCorrectionCents,retuneCorrectionCents,humanizeWeight,vibratoContributionCents,rawVibratoResidualCents,vibratoEnergyCents,vibratoDeviationCents,requestedRendererRatio,rendererPreGuardCorrectionCents,rendererPostGuardCorrectionCents,rendererCorrectionSource,deliveredRendererCorrectionCents,rendererInputCorrectionCents,rendererStepCents,correctionIsActive,targetBridge,transientBridge,dryWetMix,transpose,referenceHz,currentTargetCents,candidateTargetCents,trajectoryTransitionActive,trajectoryTransitionProgress,trajectoryTransitionStartCents,trajectoryTransitionEndCents,trajectoryTransitionDurationMs,trajectoryRapidAdjacentContour,trajectoryRendererCrossingActive,targetDecisionMidpointCents,targetDecisionExcessCents,targetHysteresisCents,pendingTargetMidi,pendingTargetFrames,targetDecisionBeyondHysteresis,rapidAdjacentRawCandidate,rapidLegatoAdjacentStep,rapidLegatoHardLock,rapidLegatoTargetChanged,rapidLegatoContinuesDirection,rapidLegatoChainStarts,rapidLegatoChainActive,rapidLegatoCommittedSteps,rapidLegatoSamplesSinceCommit,rapidLegatoDistanceCents,rapidLegatoInputMotionCentsPerSecond,trajectoryPreviewNote,trajectoryPreviewDirection,trajectoryPreviewUpdates,trajectoryPreviewTravelCents,instantaneousInputMotionCentsPerSecond,latticeReset,dryGuardActive,reentryHoldActive,sourceControlTimestamp,sourceControlF0Hz,sourceControlTargetCents,sourceControlTargetMidi,sourceControlValid,sourceControlHoldDry,sourceControlPitchRatio,olaOverlapWeight,olaAudibleRatioAtStart,olaAudibleGrainAge,olaAudibleReadPosition,olaDominantGrainWeight,olaDominantGrainEpoch,olaDominantGrainRatio,olaDominantGrainExpectedF0,olaDominantGrainTargetMidi,olaDominantGrainTargetEventId,olaDominantGrainTargetControlTimestamp,olaTargetCandidateWeight,olaTargetCandidateEpoch,olaTargetCandidateExpectedF0,olaShadowFutureSegments,olaShadowAudibleSegments,olaShadowFutureSamples,olaShadowReplacementEligible,olaShadowReplacementFirstSample,olaShadowReplacementLastSample,olaShadowCandidateRenderApplied,nextEpochBeforeReversal,nextEpochAfterReversal,actualSpawnEpoch,ratioAtSpawn,spawnTargetMidi,spawnTargetEventId,spawnTargetControlTimestamp,spawnSourceMarkF0,spawnExpectedF0,olaSourceMarkTime,olaSourceMarkF0,olaExpectedGrainF0,synthExpectedPeriod,synthActualPeriod,synthPeriodError,synthSourceSpacing,sourceSelectionCursor,newestCompleteSourceMark,sibilanceResidualMix,rendererHighFrequencyEvidence,rendererPeriodicCoherence,pitchMarkCandidateOffset,pitchMarkCandidateCorrelation,confirmedPitchMarkOffset,confirmedPitchMarkRun,rendererArtifactDryVeto,rendererGrainStarved,rendererShouldRenderWet,rendererSafetyDrySamples\n";
 }
 
 void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDiagnosticFrame& f, double sampleRate)
@@ -205,7 +290,8 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
         << f.pitchConfidence << ',' << f.rawF0Hz << ',' << f.stableF0Hz << ',' << f.rawMidi << ',' << f.key << ',' << f.scale << ','
         << f.committedTargetMidi << ',' << f.targetChanged << ',' << f.flexCorrectionGain << ','
         << f.desiredCorrectionCents << ',' << f.retuneCorrectionCents << ',' << f.humanizeWeight << ','
-        << f.vibratoContributionCents << ',' << f.requestedRendererRatio << ','
+        << f.vibratoContributionCents << ',' << f.rawVibratoResidualCents << ','
+        << f.vibratoEnergyCents << ',' << f.vibratoDeviationCents << ',' << f.requestedRendererRatio << ','
         << f.rendererPreGuardCorrectionCents << ',' << f.rendererPostGuardCorrectionCents << ',' << correctionSource << ','
         << f.deliveredRendererCorrectionCents << ',' << f.rendererInputCorrectionCents << ',' << f.rendererStepCents << ',' << f.correctionIsActive << ','
         << f.targetBridge << ',' << f.transientBridge << ',' << f.dryWetMix << ','
@@ -222,6 +308,9 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
         << f.rapidLegatoChainStarts << ',' << f.rapidLegatoChainActive << ','
         << f.rapidLegatoCommittedSteps << ',' << f.rapidLegatoSamplesSinceCommit << ','
         << f.rapidLegatoDistanceCents << ',' << f.rapidLegatoInputMotionCentsPerSecond << ','
+        << f.trajectoryPreviewNote << ',' << f.trajectoryPreviewDirection << ','
+        << f.trajectoryPreviewUpdates << ',' << f.trajectoryPreviewTravelCents << ','
+        << f.instantaneousInputMotionCentsPerSecond << ','
         << f.latticeReset << ',' << f.dryGuardActive << ',' << f.reentryHoldActive << ','
         << f.sourceControlTimestamp << ',' << f.sourceControlF0Hz << ',' << f.sourceControlTargetCents << ','
         << f.sourceControlTargetMidi << ',' << f.sourceControlValid << ',' << f.sourceControlHoldDry << ',' << f.sourceControlPitchRatio << ','
@@ -251,9 +340,9 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
 
 int main (int argc, char* argv[])
 {
-    if (argc != 3 && argc != 5 && argc != 7 && argc != 8 && argc != 9 && argc != 10 && argc != 11 && argc != 12)
+    if (argc != 3 && argc != 5 && argc != 7 && argc != 8 && argc != 9 && argc != 10 && argc != 11 && argc != 12 && argc != 13 && argc != 14 && argc != 15)
     {
-        std::cerr << "usage: VibeAutotuneSignalChainDiagnostic <input-wav> <output-directory> [classic formant] [retune-ms flex-percent [waveform-anchored-source-marks [voiced-colour-percent [phase-continuous-renderer [phase-force-unity-ratio [phase-force-static-up-ratio]]]]]]\n";
+        std::cerr << "usage: VibeAutotuneSignalChainDiagnostic <input-wav> <output-directory> [classic formant] [retune-ms flex-percent [waveform-anchored-source-marks [voiced-colour-percent [phase-continuous-renderer [phase-force-unity-ratio [phase-force-static-up-ratio [humanize natural-vibrato [natural-surface-csv]]]]]]]]]\n";
         return 2;
     }
 
@@ -280,6 +369,9 @@ int main (int argc, char* argv[])
     const auto phaseContinuousRenderer = argc >= 10 ? std::atoi (argv[9]) != 0 : true;
     const auto phaseForceUnityRatio = argc >= 11 && std::atoi (argv[10]) != 0;
     const auto phaseForceStaticUpRatio = argc >= 12 && std::atoi (argv[11]) != 0;
+    const auto humanizePercent = argc >= 13 ? std::strtof (argv[12], nullptr) : 0.0f;
+    const auto naturalVibratoPercent = argc >= 14 ? std::strtof (argv[13], nullptr) : 0.0f;
+    const juce::File naturalSurfaceFile (argc >= 15 ? argv[14] : "");
     std::ofstream metrics (outputDirectory.getChildFile ("case_metrics.csv").getFullPathName().toStdString());
     metrics << "case,rms,peak,maxSampleStep,nonFiniteSamples,firstClippedSample,latencySamples,note\n";
     std::ofstream csv (outputDirectory.getChildFile ("full_default_intervals.csv").getFullPathName().toStdString());
@@ -300,6 +392,16 @@ int main (int argc, char* argv[])
     renderedStream.release();
 
     VibeAutotuneProcessor processor;
+    if (argc >= 15)
+    {
+        CorrectionTrajectory::NaturalVibratoSurface surface;
+        if (! loadNaturalVibratoSurface (naturalSurfaceFile, surface))
+        {
+            std::cerr << "natural surface must contain exactly 21 comma-separated gains\n";
+            return 2;
+        }
+        processor.setNaturalVibratoSurfaceDiagnostic (surface);
+    }
     processor.prepareToPlay (reader->sampleRate, blockSize);
     processor.setSignalChainDiagnosticEnabled (true);
     CausalTDPSOLARenderer::DiagnosticAblation ablation;
@@ -312,8 +414,8 @@ int main (int argc, char* argv[])
     setParameter (processor, "bypass", 0.0f);
     setParameter (processor, "retuneSpeed", retuneMs);
     setParameter (processor, "flexTune", flexTunePercent);
-    setParameter (processor, "humanize", 0.0f);
-    setParameter (processor, "naturalVibrato", 0.0f);
+    setParameter (processor, "humanize", humanizePercent);
+    setParameter (processor, "naturalVibrato", naturalVibratoPercent);
     setParameter (processor, "voicedColour", voicedColourPercent);
     // Match the reference-performance page explicitly. Do not rely on the
     // processor's shipped defaults: a diagnostic must remain reproducible if
@@ -330,8 +432,10 @@ int main (int argc, char* argv[])
               << "Voice,Alto/1/Alto,YIN profile\nKey,F#/6/6,target selector\nScale,Natural Minor/2/2,note policy\n"
               << "Transpose,0 st/0/0,trajectory\nReference,440 Hz/440/440,Hz-note mapping\nTracking,50%/50/50,YIN gate\n"
               << "Retune," << retuneMs << " ms/" << retuneMs << "/" << retuneMs << ",trajectory\n"
-              << "Flex-Tune," << flexTunePercent << '/' << flexTunePercent << '/' << flexTunePercent << ",trajectory\nHumanize,0%/0/0,trajectory\n"
-              << "Natural Vibrato,0%/0/0,trajectory\nGroup Octaves,state/state,state,note policy\nNote Map Rules,state/state,state,target selector\n";
+              << "Flex-Tune," << flexTunePercent << '/' << flexTunePercent << '/' << flexTunePercent << ",trajectory\n"
+              << "Humanize," << humanizePercent << "%/" << humanizePercent << '/' << humanizePercent << ",trajectory\n"
+              << "Natural Vibrato," << naturalVibratoPercent << " ms/" << naturalVibratoPercent << '/' << naturalVibratoPercent
+              << ",trajectory\nGroup Octaves,state/state,state,note policy\nNote Map Rules,state/state,state,target selector\n";
 
     juce::AudioBuffer<float> source (static_cast<int> (reader->numChannels), blockSize);
     // Production AU now exposes a mono vocal path. Feeding a two-channel
@@ -424,6 +528,19 @@ int main (int argc, char* argv[])
         }
 
         std::ofstream plateauAudit (outputDirectory.getChildFile ("plateau_audit.csv").getFullPathName().toStdString());
+        // This is deliberately the same 256-sample lattice as the Artist
+        // control-grid CSVs.  It turns a full render into a machine-readable
+        // candidate for the surface optimiser; it is not a live DSP path.
+        std::ofstream contour (outputDirectory.getChildFile ("contour.csv").getFullPathName().toStdString());
+        contour << "sample,independent_f0_hz\n";
+        for (int sample = 2048; sample <= fullDefaultOutput.getNumSamples(); sample += 256)
+        {
+            const auto f0 = estimateControlGridF0 (fullDefaultOutput, sample, reader->sampleRate);
+            contour << sample << ',';
+            if (std::isfinite (f0)) contour << f0;
+            else contour << "nan";
+            contour << '\n';
+        }
         // TD-PSOLA is causal: output at t + processor latency belongs to
         // source/control at t.  Never compare a control frame with audio at
         // the same timestamp or an intact hard lock will look falsely flat.

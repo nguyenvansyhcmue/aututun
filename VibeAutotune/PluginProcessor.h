@@ -117,6 +117,9 @@ public:
         float retuneCorrectionCents = 0.0f;
         float humanizeWeight = 0.0f;
         float vibratoContributionCents = 0.0f;
+        float rawVibratoResidualCents = 0.0f;
+        float vibratoEnergyCents = 0.0f;
+        float vibratoDeviationCents = 0.0f;
         float referenceHz = 440.0f;
         int voiceRangeMinHz = 0;
         int voiceRangeMaxHz = 0;
@@ -155,6 +158,11 @@ public:
         int rapidLegatoSamplesSinceCommit = 0;
         double rapidLegatoDistanceCents = 0.0;
         double rapidLegatoInputMotionCentsPerSecond = 0.0;
+        int trajectoryPreviewNote = -1;
+        int trajectoryPreviewDirection = 0;
+        int trajectoryPreviewUpdates = 0;
+        double trajectoryPreviewTravelCents = 0.0;
+        double instantaneousInputMotionCentsPerSecond = 0.0;
         bool latticeReset = false;
         bool dryGuardActive = false;
         bool reentryHoldActive = false;
@@ -254,6 +262,13 @@ public:
     RendererDiscontinuityData getRendererDiscontinuityData() const noexcept;
     void setSignalChainDiagnosticEnabled (bool shouldEnable) noexcept;
     void setRendererDiagnosticAblation (CausalTDPSOLARenderer::DiagnosticAblation value) noexcept;
+    void setControlCalibrationDiagnostic (double pitchCentreSeconds,
+                                          double wideVibratoNeutralRetention,
+                                          double wideVibratoHumanizedRetention) noexcept;
+    // Offline benchmark hook only. It lets the control-surface optimiser
+    // render a candidate without making that candidate the plug-in default.
+    void setNaturalVibratoSurfaceDiagnostic (
+        const CorrectionTrajectory::NaturalVibratoSurface& surface) noexcept;
     int copySignalChainDiagnosticFrames (SignalChainDiagnosticFrame* destination, int maximumFrames) const noexcept;
     // Live capture is intentionally separate from the short offline test
     // snapshot above. It is a lock-free, allocation-free audio-thread trace
@@ -327,6 +342,11 @@ private:
         uint64_t timestampSamples = 0;
         double stableF0Hz = std::numeric_limits<double>::quiet_NaN();
         double pitchRatio = 1.0;
+        // The intentional Humanize/Natural-Vibrato departure is carried
+        // separately from the base note-correction ratio.  A PSOLA lattice
+        // can then keep a slow Retune move in flight without cancelling the
+        // residual once the base correction has reached its note.
+        double residualPitchCents = 0.0;
         bool valid = false;
         bool holdDry = false;
         bool targetBridge = false;
@@ -359,6 +379,7 @@ private:
                                      uint64_t frameEndSample) noexcept;
     void resetPsolaRenderer() noexcept;
     void pushPsolaControlFrame (uint64_t timestampSamples, double stableF0Hz, double pitchRatio,
+                                double residualPitchCents,
                                 bool valid, bool holdDry = false, bool targetBridge = false,
                                 bool transientBridge = false, int targetMidi = -1,
                                 double targetPitchCents = std::numeric_limits<double>::quiet_NaN(),
@@ -420,7 +441,7 @@ private:
     // The spectral renderer is the production path because it is the
     // closest pitch/timbre match to the Artist reference on sustained vocal.
     // TD-PSOLA remains available for diagnostic comparisons.
-    bool usePhaseContinuousRenderer = true;
+    bool usePhaseContinuousRenderer = false;
     bool phaseForceUnityRatioForDiagnostic = false;
     bool phaseForceStaticUpRatioForDiagnostic = false;
     int rendererLatencySamples = 0;
