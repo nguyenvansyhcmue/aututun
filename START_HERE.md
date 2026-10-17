@@ -15,7 +15,9 @@ Read START_HERE.md completely and follow it as the active handoff. First inspect
 | Need | File / location |
 | --- | --- |
 | Control-target mapping | `benchmark/autotune-artist-controls/TARGET_MANIFEST.csv` |
+| Current 27-tuple production benchmark | `renders/control-manifest-slow-retune-production-20260930/README.md` |
 | Control stimuli and measurement rules | `benchmark/autotune-artist-controls/README.md` |
+| Missing-combo and rapid-legato requirements | `benchmark/autotune-artist-controls/NEXT_TARGET_REQUIREMENTS.md` |
 | Rapid-legato technical history | `CODEX_HANDOFF_2026-09-28.md` |
 | Portable vocal comparison bundle | `data/session-2026-09-28/README.md` |
 | Artist vocal reference | `renders/target-autotune-artist.wav` |
@@ -31,10 +33,21 @@ The listening-approved `1.0.3` component is a binary reference only. Its exact s
 `TARGET_MANIFEST.csv` is authoritative. Select a target by its `id`, not by its legacy filename. It includes the full known configuration, SHA-256 and a status for each render.
 
 - Use only `verified` targets for normal single-control calibration.
-- `verified_noncanonical_retune` Flex targets are valid at Retune 10 ms, but do not stand in for the still-missing Retune 25 ms data.
-- Natural Vibrato `0 ms` and `+9 ms` are explicitly missing. Do not invent a curve through either hole.
-- Never use files in `archive-controls-on-flex-input/` to fit Humanize or Natural Vibrato independently: their input/control state is mixed.
-- No complete four-knob interaction target matrix exists. A one-control fit must not be presented as proof of arbitrary combined-control equivalence.
+- The complete measured Flex set is available at Retune 0 and 10 ms.
+- The complete measured Natural Vibrato set is available at -12/-9/-6/0/+3/+6/+9/+12 ms.
+- Legacy prefixes such as `flex_timeline` and `humanize_timeline` identify the source timeline, not the active control. Use manifest columns only.
+- Every verified target is an authoritative four-knob tuple, even when only
+  one displayed control differs from its neutral value. Calibrate and report
+  the tuple as a whole; do not treat a family sweep as a disconnected
+  post-process. The verified rows form the measured response surface, not a
+  claim that every possible Cartesian combination has been bounced.
+- The portable bundle
+  `benchmark/autotune-artist-controls/VibeAutotune-ArtistControlTargets-verified-20260929.zip`
+  has only the verified single-control sweeps. In particular, **there is no
+  official target** yet for `Retune 300 + Humanize 50`, `Retune 400 + Natural
+  Vibrato -6`, or any other unlisted combined tuple. Never synthesize one by
+  mixing separate reference files; request/bounce the exact Artist tuple and
+  add it to the manifest first.
 
 ## Fixed vocal-reference preset
 

@@ -13,7 +13,40 @@
 
 namespace
 {
-constexpr int blockSize = 256;
+int diagnosticBlockSize()
+{
+    const auto* requested = std::getenv ("VIBE_DIAGNOSTIC_BLOCK_SIZE");
+    const auto value = requested != nullptr ? std::atoi (requested) : 256;
+    return value > 0 ? value : 256;
+}
+
+std::vector<int> diagnosticBlockSequence()
+{
+    const auto* requested = std::getenv ("VIBE_DIAGNOSTIC_BLOCK_SEQUENCE");
+    if (requested == nullptr || *requested == '\0')
+        return {};
+
+    std::vector<int> sequence;
+    std::stringstream stream (requested);
+    std::string token;
+    while (std::getline (stream, token, ','))
+    {
+        const auto value = std::atoi (token.c_str());
+        if (value <= 0)
+            return {};
+        sequence.push_back (value);
+    }
+    return sequence;
+}
+
+int diagnosticSourceSampleLimit (int64_t availableSamples)
+{
+    const auto* requested = std::getenv ("VIBE_DIAGNOSTIC_SOURCE_SAMPLE_LIMIT");
+    if (requested == nullptr || *requested == '\0')
+        return static_cast<int> (availableSamples);
+    const auto value = std::strtoll (requested, nullptr, 10);
+    return static_cast<int> (std::clamp<int64_t> (value, 0, availableSamples));
+}
 constexpr int rendererControlIntervalSamples = 128;
 
 struct AudioMetrics
@@ -277,7 +310,19 @@ bool loadNaturalVibratoSurface (const juce::File& file,
 
 void writeHeader (std::ofstream& csv)
 {
-    csv << "sampleIndex,timeMs,voiceRangeMin,voiceRangeMax,trackingValue,voiced,pitchConfidence,rawF0,stableF0,rawMidi,key,scale,committedTargetMidi,targetChanged,flexWeight,desiredCorrectionCents,retuneCorrectionCents,humanizeWeight,vibratoContributionCents,rawVibratoResidualCents,vibratoEnergyCents,vibratoDeviationCents,requestedRendererRatio,rendererPreGuardCorrectionCents,rendererPostGuardCorrectionCents,rendererCorrectionSource,deliveredRendererCorrectionCents,rendererInputCorrectionCents,rendererStepCents,correctionIsActive,targetBridge,transientBridge,dryWetMix,transpose,referenceHz,currentTargetCents,candidateTargetCents,trajectoryTransitionActive,trajectoryTransitionProgress,trajectoryTransitionStartCents,trajectoryTransitionEndCents,trajectoryTransitionDurationMs,trajectoryRapidAdjacentContour,trajectoryRendererCrossingActive,targetDecisionMidpointCents,targetDecisionExcessCents,targetHysteresisCents,pendingTargetMidi,pendingTargetFrames,targetDecisionBeyondHysteresis,rapidAdjacentRawCandidate,rapidLegatoAdjacentStep,rapidLegatoHardLock,rapidLegatoTargetChanged,rapidLegatoContinuesDirection,rapidLegatoChainStarts,rapidLegatoChainActive,rapidLegatoCommittedSteps,rapidLegatoSamplesSinceCommit,rapidLegatoDistanceCents,rapidLegatoInputMotionCentsPerSecond,trajectoryPreviewNote,trajectoryPreviewDirection,trajectoryPreviewUpdates,trajectoryPreviewTravelCents,instantaneousInputMotionCentsPerSecond,latticeReset,dryGuardActive,reentryHoldActive,sourceControlTimestamp,sourceControlF0Hz,sourceControlTargetCents,sourceControlTargetMidi,sourceControlValid,sourceControlHoldDry,sourceControlPitchRatio,olaOverlapWeight,olaAudibleRatioAtStart,olaAudibleGrainAge,olaAudibleReadPosition,olaDominantGrainWeight,olaDominantGrainEpoch,olaDominantGrainRatio,olaDominantGrainExpectedF0,olaDominantGrainTargetMidi,olaDominantGrainTargetEventId,olaDominantGrainTargetControlTimestamp,olaTargetCandidateWeight,olaTargetCandidateEpoch,olaTargetCandidateExpectedF0,olaShadowFutureSegments,olaShadowAudibleSegments,olaShadowFutureSamples,olaShadowReplacementEligible,olaShadowReplacementFirstSample,olaShadowReplacementLastSample,olaShadowCandidateRenderApplied,nextEpochBeforeReversal,nextEpochAfterReversal,actualSpawnEpoch,ratioAtSpawn,spawnTargetMidi,spawnTargetEventId,spawnTargetControlTimestamp,spawnSourceMarkF0,spawnExpectedF0,olaSourceMarkTime,olaSourceMarkF0,olaExpectedGrainF0,synthExpectedPeriod,synthActualPeriod,synthPeriodError,synthSourceSpacing,sourceSelectionCursor,newestCompleteSourceMark,sibilanceResidualMix,rendererHighFrequencyEvidence,rendererPeriodicCoherence,pitchMarkCandidateOffset,pitchMarkCandidateCorrelation,confirmedPitchMarkOffset,confirmedPitchMarkRun,rendererArtifactDryVeto,rendererGrainStarved,rendererShouldRenderWet,rendererSafetyDrySamples\n";
+    csv << "sampleIndex,timeMs,voiceRangeMin,voiceRangeMax,trackingValue,retuneSpeedMs,flexTunePercent,humanizePercent,naturalVibratoPercent,voiced,pitchConfidence,rawF0,stableF0,rawMidi,key,scale,committedTargetMidi,targetChanged,flexWeight,desiredCorrectionCents,retuneCorrectionCents,humanizeWeight,vibratoContributionCents,rawVibratoResidualCents,vibratoEnergyCents,vibratoDeviationCents,pitchNoteCenterCents,pitchDriftCents,pitchVibratoRateHz,pitchVibratoConfidence,pitchNoteStability,pitchDriftConfidence,pitchJitterConfidence,requestedRendererRatio,rendererPreGuardCorrectionCents,rendererPostGuardCorrectionCents,rendererCorrectionSource,deliveredRendererCorrectionCents,rendererInputCorrectionCents,rendererStepCents,correctionIsActive,targetBridge,transientBridge,dryWetMix,transpose,referenceHz,currentTargetCents,candidateTargetCents,trajectoryTransitionActive,trajectoryTransitionProgress,trajectoryTransitionStartCents,trajectoryTransitionEndCents,trajectoryTransitionDurationMs,trajectoryRapidAdjacentContour,trajectoryRendererCrossingActive,trajectoryRendererCrossingTargetMidi,trajectoryRendererCrossingProgress,trajectoryExcursionActive,trajectoryExcursionPhase,trajectoryExcursionConsumed,trajectoryExcursionOwnsControl,targetDecisionMidpointCents,targetDecisionExcessCents,targetHysteresisCents,pendingTargetMidi,pendingTargetFrames,targetDecisionBeyondHysteresis,rapidAdjacentRawCandidate,rapidAdjacentPrearmed,rapidAdjacentCandidateMidi,rapidAdjacentEvidenceFrames,rapidAdjacentRawDistanceCents,rapidLegatoAdjacentStep,rapidLegatoHardLock,rapidLegatoTargetChanged,rapidLegatoContinuesDirection,rapidLegatoChainStarts,rapidLegatoChainActive,rapidLegatoCommittedSteps,rapidLegatoSamplesSinceCommit,rapidLegatoDistanceCents,rapidLegatoInputMotionCentsPerSecond,trajectoryPreviewNote,trajectoryPreviewDirection,trajectoryPreviewUpdates,trajectoryPreviewTravelCents,instantaneousInputMotionCentsPerSecond,selectorCurrentTargetBefore,selectorPreviousTarget,selectorCandidate,selectorFramesSinceCommit,selectorDecision,trajectoryPortamentoActive,trajectoryUsesPortamentoTarget,latticeReset,dryGuardActive,reentryHoldActive,sourceControlTimestamp,outputRendererControlTimestamp,outputRendererControlPitchRatio,outputRendererControlTargetMidi,sourceControlF0Hz,sourceControlTargetCents,sourceControlTargetMidi,sourceControlValid,sourceControlHoldDry,sourceControlPitchRatio,sourceControlTrajectoryExcursionActive,sourceControlTrajectoryExcursionPhase,sourceControlTrajectoryExcursionOwnsControl,rendererStrongRatioStep,rendererRapidCorrectionReversal,rendererTargetCommitted,sourceCursorBeforeStrongStep,sourceCursorAfterStrongStep,sourceCursorReanchorSuppressed,fractionalPhaseOffsetAtSpawn,overlapPhaseOffsetAtSpawn,olaOverlapWeight,olaAudibleRatioAtStart,olaAudibleGrainAge,olaAudibleReadPosition,olaDominantGrainWeight,olaDominantGrainEpoch,olaDominantGrainRatio,olaDominantGrainExpectedF0,olaDominantGrainTargetMidi,olaDominantGrainTargetEventId,olaDominantGrainTargetControlTimestamp,olaTargetCandidateWeight,olaTargetCandidateEpoch,olaTargetCandidateExpectedF0,olaShadowFutureSegments,olaShadowAudibleSegments,olaShadowFutureSamples,olaShadowReplacementEligible,olaShadowReplacementFirstSample,olaShadowReplacementLastSample,olaShadowCandidateRenderApplied,nextEpochBeforeReversal,nextEpochAfterReversal,actualSpawnEpoch,ratioAtSpawn,spawnTargetMidi,spawnTargetEventId,spawnTargetControlTimestamp,spawnSourceMarkF0,spawnExpectedF0,olaSourceMarkTime,olaSourceMarkF0,olaExpectedGrainF0,synthExpectedPeriod,synthActualPeriod,synthPeriodError,synthSourceSpacing,sourceSelectionCursor,newestCompleteSourceMark,sibilanceResidualMix,rendererHighFrequencyEvidence,rendererPeriodicCoherence,pitchMarkCandidateOffset,pitchMarkCandidateCorrelation,confirmedPitchMarkOffset,confirmedPitchMarkRun,rendererArtifactDryVeto,rendererGrainStarved,rendererShouldRenderWet,rendererSafetyDrySamples\n";
+    // The main header above predates trajectory-only renderer provenance.
+    // Replace its trailing newline so these two forensic columns remain part
+    // of the same CSV record without perturbing existing column positions.
+    csv.seekp (-1, std::ios_base::end);
+    csv << ",olaDominantGrainTrajectoryExcursionId,spawnTrajectoryExcursionId"
+        << ",callerControlLookupTime,rendererControlLookupTime,controlLookupDeltaSamples"
+        << ",callerControlTimestamp,rendererControlTimestamp,callerControlEventId,rendererControlEventId"
+        << ",callerControlPitchRatio,rendererControlPitchRatio"
+        << ",olaDominantGrainControlEventId,olaNewestTargetGrainWeight,olaPreviousTargetGrainWeight"
+        << ",olaNewestTargetFirstAudibleSample,olaPreviousTargetLastAudibleSample"
+        << ",sourceControlMaterializationAdvanceSamples,sourceControlCorrectionBefore,sourceControlCorrectionAfter"
+        << ",grainDecisionInputSample,grainFirstAudibleSample,grainHalfWindowAtSpawn,grainSourceMarkAtSpawn\n";
 }
 
 void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDiagnosticFrame& f, double sampleRate)
@@ -286,12 +331,18 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
                                 : f.rendererCorrectionSource == 1 ? "INVALID_CONTROL"
                                                                   : "DRY_GUARD";
     csv << f.sampleIndex << ',' << (1000.0 * static_cast<double> (f.sampleIndex) / sampleRate) << ','
-        << f.voiceRangeMinHz << ',' << f.voiceRangeMaxHz << ',' << f.trackingValue << ',' << f.voiced << ','
+        << f.voiceRangeMinHz << ',' << f.voiceRangeMaxHz << ',' << f.trackingValue << ','
+        << f.retuneSpeedMs << ',' << f.flexTunePercent << ',' << f.humanizePercent << ','
+        << f.naturalVibratoPercent << ',' << f.voiced << ','
         << f.pitchConfidence << ',' << f.rawF0Hz << ',' << f.stableF0Hz << ',' << f.rawMidi << ',' << f.key << ',' << f.scale << ','
         << f.committedTargetMidi << ',' << f.targetChanged << ',' << f.flexCorrectionGain << ','
         << f.desiredCorrectionCents << ',' << f.retuneCorrectionCents << ',' << f.humanizeWeight << ','
         << f.vibratoContributionCents << ',' << f.rawVibratoResidualCents << ','
-        << f.vibratoEnergyCents << ',' << f.vibratoDeviationCents << ',' << f.requestedRendererRatio << ','
+        << f.vibratoEnergyCents << ',' << f.vibratoDeviationCents << ','
+        << f.pitchNoteCenterCents << ',' << f.pitchDriftCents << ','
+        << f.pitchVibratoRateHz << ',' << f.pitchVibratoConfidence << ',' << f.pitchNoteStability << ','
+        << f.pitchDriftConfidence << ',' << f.pitchJitterConfidence << ','
+        << f.requestedRendererRatio << ','
         << f.rendererPreGuardCorrectionCents << ',' << f.rendererPostGuardCorrectionCents << ',' << correctionSource << ','
         << f.deliveredRendererCorrectionCents << ',' << f.rendererInputCorrectionCents << ',' << f.rendererStepCents << ',' << f.correctionIsActive << ','
         << f.targetBridge << ',' << f.transientBridge << ',' << f.dryWetMix << ','
@@ -300,9 +351,14 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
         << f.trajectoryTransitionStartCents << ',' << f.trajectoryTransitionEndCents << ','
         << f.trajectoryTransitionDurationMs << ',' << f.trajectoryRapidAdjacentContour << ','
         << f.trajectoryRendererCrossingActive << ','
+        << f.trajectoryRendererCrossingTargetMidi << ',' << f.trajectoryRendererCrossingProgress << ','
+        << f.trajectoryExcursionActive << ',' << static_cast<int> (f.trajectoryExcursionPhase) << ','
+        << f.trajectoryExcursionConsumed << ',' << f.trajectoryExcursionOwnsControl << ','
         << f.targetDecisionMidpointCents << ',' << f.targetDecisionExcessCents << ','
         << f.targetHysteresisCents << ',' << f.pendingTargetMidi << ',' << f.pendingTargetFrames << ','
         << f.targetDecisionBeyondHysteresis << ',' << f.rapidAdjacentRawCandidate << ','
+        << f.rapidAdjacentPrearmed << ',' << f.rapidAdjacentCandidateMidi << ','
+        << f.rapidAdjacentEvidenceFrames << ',' << f.rapidAdjacentRawDistanceCents << ','
         << f.rapidLegatoAdjacentStep << ',' << f.rapidLegatoHardLock << ',' << f.rapidLegatoTargetChanged << ','
         << f.rapidLegatoContinuesDirection << ','
         << f.rapidLegatoChainStarts << ',' << f.rapidLegatoChainActive << ','
@@ -311,9 +367,20 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
         << f.trajectoryPreviewNote << ',' << f.trajectoryPreviewDirection << ','
         << f.trajectoryPreviewUpdates << ',' << f.trajectoryPreviewTravelCents << ','
         << f.instantaneousInputMotionCentsPerSecond << ','
+        << f.selectorCurrentTargetBefore << ',' << f.selectorPreviousTarget << ','
+        << f.selectorCandidate << ',' << f.selectorFramesSinceCommit << ',' << f.selectorDecision << ','
+        << f.trajectoryPortamentoActive << ','
+        << f.trajectoryUsesPortamentoTarget << ','
         << f.latticeReset << ',' << f.dryGuardActive << ',' << f.reentryHoldActive << ','
-        << f.sourceControlTimestamp << ',' << f.sourceControlF0Hz << ',' << f.sourceControlTargetCents << ','
+        << f.sourceControlTimestamp << ',' << f.outputRendererControlTimestamp << ','
+        << f.outputRendererControlPitchRatio << ',' << f.outputRendererControlTargetMidi << ','
+        << f.sourceControlF0Hz << ',' << f.sourceControlTargetCents << ','
         << f.sourceControlTargetMidi << ',' << f.sourceControlValid << ',' << f.sourceControlHoldDry << ',' << f.sourceControlPitchRatio << ','
+        << f.sourceControlTrajectoryExcursionActive << ',' << static_cast<int> (f.sourceControlTrajectoryExcursionPhase) << ','
+        << f.sourceControlTrajectoryExcursionOwnsControl << ','
+        << f.rendererStrongRatioStep << ',' << f.rendererRapidCorrectionReversal << ',' << f.rendererTargetCommitted << ','
+        << f.sourceCursorBeforeStrongStep << ',' << f.sourceCursorAfterStrongStep << ','
+        << f.sourceCursorReanchorSuppressed << ',' << f.fractionalPhaseOffsetAtSpawn << ',' << f.overlapPhaseOffsetAtSpawn << ','
         << f.olaOverlapWeight << ',' << f.olaAudibleRatioAtStart << ',' << f.olaAudibleGrainAge << ','
         << f.olaAudibleReadPosition << ',' << f.olaDominantGrainWeight << ','
         << f.olaDominantGrainEpoch << ',' << f.olaDominantGrainRatio << ','
@@ -334,15 +401,27 @@ void writeFrame (std::ofstream& csv, const VibeAutotuneProcessor::SignalChainDia
         << f.rendererHighFrequencyEvidence << ',' << f.rendererPeriodicCoherence << ','
         << f.pitchMarkCandidateOffset << ',' << f.pitchMarkCandidateCorrelation << ','
         << f.confirmedPitchMarkOffset << ',' << f.confirmedPitchMarkRun << ','
-        << f.rendererArtifactDryVeto << ',' << f.rendererGrainStarved << ',' << f.rendererShouldRenderWet << ',' << f.rendererSafetyDrySamples << '\n';
+        << f.rendererArtifactDryVeto << ',' << f.rendererGrainStarved << ',' << f.rendererShouldRenderWet << ',' << f.rendererSafetyDrySamples << ','
+        << f.olaDominantGrainTrajectoryExcursionId << ',' << f.spawnTrajectoryExcursionId << ','
+        << f.callerControlLookupTime << ',' << f.rendererControlLookupTime << ',' << f.controlLookupDeltaSamples << ','
+        << f.callerControlTimestamp << ',' << f.rendererControlTimestamp << ','
+        << f.callerControlEventId << ',' << f.rendererControlEventId << ','
+        << f.callerControlPitchRatio << ',' << f.rendererControlPitchRatio << ','
+        << f.olaDominantGrainControlEventId << ','
+        << f.olaNewestTargetGrainWeight << ',' << f.olaPreviousTargetGrainWeight << ','
+        << f.olaNewestTargetFirstAudibleSample << ',' << f.olaPreviousTargetLastAudibleSample << ','
+        << f.sourceControlMaterializationAdvanceSamples << ','
+        << f.sourceControlCorrectionBefore << ',' << f.sourceControlCorrectionAfter << ','
+        << f.grainDecisionInputSample << ',' << f.grainFirstAudibleSample << ','
+        << f.grainHalfWindowAtSpawn << ',' << f.grainSourceMarkAtSpawn << '\n';
 }
 }
 
 int main (int argc, char* argv[])
 {
-    if (argc != 3 && argc != 5 && argc != 7 && argc != 8 && argc != 9 && argc != 10 && argc != 11 && argc != 12 && argc != 13 && argc != 14 && argc != 15)
+    if (argc != 3 && argc != 5 && argc != 7 && argc != 8 && argc != 9 && argc != 10 && argc != 11 && argc != 12 && argc != 13 && argc != 14 && argc != 15 && argc != 16 && argc != 19 && argc != 20 && argc != 21 && argc != 22 && argc != 25 && argc != 26 && argc != 31 && argc != 32 && argc != 33 && argc != 34 && argc != 35 && argc != 36)
     {
-        std::cerr << "usage: VibeAutotuneSignalChainDiagnostic <input-wav> <output-directory> [classic formant] [retune-ms flex-percent [waveform-anchored-source-marks [voiced-colour-percent [phase-continuous-renderer [phase-force-unity-ratio [phase-force-static-up-ratio [humanize natural-vibrato [natural-surface-csv]]]]]]]]]\n";
+        std::cerr << "usage: VibeAutotuneSignalChainDiagnostic <input-wav> <output-directory> [... existing args ... tail-replacement onset-H fade-H old-tail-gain minimum-step-cents]\n";
         return 2;
     }
 
@@ -372,6 +451,80 @@ int main (int argc, char* argv[])
     const auto humanizePercent = argc >= 13 ? std::strtof (argv[12], nullptr) : 0.0f;
     const auto naturalVibratoPercent = argc >= 14 ? std::strtof (argv[13], nullptr) : 0.0f;
     const juce::File naturalSurfaceFile (argc >= 15 ? argv[14] : "");
+    const auto negativeNaturalPhaseScale = argc >= 16 ? std::strtod (argv[15], nullptr) : 1.0;
+    const auto pitchCentreSeconds = argc >= 19 ? std::strtod (argv[16], nullptr) : 0.250;
+    const auto wideVibratoNeutralRetention = argc >= 19 ? std::strtod (argv[17], nullptr)
+                                                         : VIBE_WIDE_VIBRATO_NEUTRAL_RETENTION;
+    const auto wideVibratoHumanizedRetention = argc >= 19 ? std::strtod (argv[18], nullptr)
+                                                           : VIBE_WIDE_VIBRATO_HUMANIZED_RETENTION;
+    const auto rapidLegatoReturnPreview = argc >= 20 && std::atoi (argv[19]) != 0;
+    const auto continuousRapidReturnExcursion = argc >= 21 && std::atoi (argv[20]) != 0;
+    const auto preserveSourceCursorDuringTrajectoryExcursion = argc >= 22 && std::atoi (argv[21]) != 0;
+    const auto excursionMinimumCoherentFrames = argc >= 25 ? std::atoi (argv[22]) : 4;
+    const auto excursionMinimumTravelCents = argc >= 25 ? std::strtod (argv[23], nullptr) : 11.0;
+    const auto excursionHoldMilliseconds = argc >= 25 ? std::strtod (argv[24], nullptr) : 50.0;
+    const auto slowRetuneInputReferenceAmountOverride = argc >= 26 ? std::strtod (argv[25], nullptr) : -1.0;
+    const auto targetAwareTailReplacement = argc >= 31 && std::atoi (argv[26]) != 0;
+    const auto targetAwareTailOnsetHalfWindows = argc >= 31 ? std::strtod (argv[27], nullptr) : 0.0;
+    const auto targetAwareTailFadeHalfWindows = argc >= 31 ? std::strtod (argv[28], nullptr) : 0.25;
+    const auto targetAwareOldTailGain = argc >= 31 ? std::strtod (argv[29], nullptr) : 0.5;
+    const auto targetAwareMinimumStepCents = argc >= 31 ? std::strtod (argv[30], nullptr) : 50.0;
+    const auto targetAwareNewGrainHammingBlend = argc >= 32 ? std::strtod (argv[31], nullptr) : 0.25;
+    const auto targetAwareWindowHalfFactorOverride = argc >= 33 ? std::strtod (argv[32], nullptr) : -1.0;
+    const auto trajectoryExcursionTailReplacement = argc >= 34 && std::atoi (argv[33]) != 0;
+    const auto cadenceOwnedExcursionRatio = argc >= 35 && std::atoi (argv[34]) != 0;
+    const auto excursionDrivesSynthesisCadence = argc >= 36 && std::atoi (argv[35]) != 0;
+    const auto pendingGrainQueue = []
+    {
+        const auto* value = std::getenv ("VIBE_PENDING_GRAIN_QUEUE");
+        return value == nullptr || std::atoi (value) != 0;
+    }();
+    const auto pendingQueueAllFutureAudible = []
+    {
+        const auto* value = std::getenv ("VIBE_PENDING_QUEUE_ALL_FUTURE_AUDIBLE");
+        return value != nullptr && std::atoi (value) != 0;
+    }();
+    const auto retimableEpochs = []
+    {
+        const auto* value = std::getenv ("VIBE_RETIMABLE_EPOCHS");
+        // Match the production default; `0` remains an explicit A/B rollback.
+        return value == nullptr || std::atoi (value) != 0;
+    }();
+    const auto rapidAdjacentTargetSelection = []
+    {
+        const auto* value = std::getenv ("VIBE_RAPID_ADJACENT_SELECTOR");
+        return value != nullptr && std::atoi (value) != 0;
+    }();
+    const auto diagnosticWideTransitionMs = []
+    {
+        const auto* value = std::getenv ("VIBE_DIAGNOSTIC_WIDE_TRANSITION_MS");
+        return value != nullptr ? std::strtod (value, nullptr) : -1.0;
+    }();
+    const auto diagnosticWideTransitionShape = []
+    {
+        const auto* value = std::getenv ("VIBE_DIAGNOSTIC_WIDE_TRANSITION_SHAPE");
+        return value != nullptr ? std::atoi (value) : 0;
+    }();
+    const auto diagnosticWideTransitionDownMs = [&]
+    {
+        const auto* value = std::getenv ("VIBE_DIAGNOSTIC_WIDE_TRANSITION_DOWN_MS");
+        return value != nullptr ? std::strtod (value, nullptr) : diagnosticWideTransitionMs;
+    }();
+    const auto epochTraceEnabled = []
+    {
+        const auto* value = std::getenv ("VIBE_EPOCH_TRACE");
+        return value != nullptr && std::atoi (value) != 0;
+    }();
+    const auto olaTraceStart = []
+    {
+        const auto* value = std::getenv ("VIBE_OLA_TRACE_START");
+        return value != nullptr ? static_cast<uint64_t> (std::strtoull (value, nullptr, 10)) : uint64_t { 1 };
+    }();
+    const auto olaTraceEnd = []
+    {
+        const auto* value = std::getenv ("VIBE_OLA_TRACE_END");
+        return value != nullptr ? static_cast<uint64_t> (std::strtoull (value, nullptr, 10)) : uint64_t { 0 };
+    }();
     std::ofstream metrics (outputDirectory.getChildFile ("case_metrics.csv").getFullPathName().toStdString());
     metrics << "case,rms,peak,maxSampleStep,nonFiniteSamples,firstClippedSample,latencySamples,note\n";
     std::ofstream csv (outputDirectory.getChildFile ("full_default_intervals.csv").getFullPathName().toStdString());
@@ -380,19 +533,31 @@ int main (int argc, char* argv[])
     events << "sampleIndex,timeMs,event,detail\n";
 
     const auto renderedFile = outputDirectory.getChildFile ("full_default_render.wav");
-    std::unique_ptr<juce::FileOutputStream> renderedStream (renderedFile.createOutputStream());
+    std::unique_ptr<juce::OutputStream> renderedStream (renderedFile.createOutputStream());
     juce::WavAudioFormat wav;
+    // Use PCM16 for the streamed diagnostic export. The legacy 24-bit packing
+    // path can introduce a false spike in long exports; the in-memory metric
+    // remains the authoritative safety measurement, while PCM16 is stable for
+    // the independent contour/envelope comparisons performed by this tool.
+    // Keep this diagnostic compatible with JUCE 7 hosts as well as JUCE 8.
+    // The legacy overload transfers ownership of renderedStream to the writer.
+    const juce::StringPairArray renderedMetadata;
     std::unique_ptr<juce::AudioFormatWriter> renderedWriter (
-        renderedStream != nullptr ? wav.createWriterFor (renderedStream.get(), reader->sampleRate, 1, 24, {}, 0) : nullptr);
+        renderedStream != nullptr ? wav.createWriterFor (renderedStream.release(), reader->sampleRate,
+                                                          juce::AudioChannelSet::mono(), 16, renderedMetadata, 0) : nullptr);
     if (renderedWriter == nullptr)
     {
         std::cerr << "unable to create render wav\n";
         return 2;
     }
-    renderedStream.release();
 
+    const auto blockSequence = diagnosticBlockSequence();
+    const auto blockSize = blockSequence.empty()
+                         ? diagnosticBlockSize()
+                         : *std::max_element (blockSequence.begin(), blockSequence.end());
+    const auto sourceSampleLimit = static_cast<int64_t> (diagnosticSourceSampleLimit (reader->lengthInSamples));
     VibeAutotuneProcessor processor;
-    if (argc >= 15)
+    if (argc >= 15 && naturalSurfaceFile.getFileName() != "-")
     {
         CorrectionTrajectory::NaturalVibratoSurface surface;
         if (! loadNaturalVibratoSurface (naturalSurfaceFile, surface))
@@ -402,13 +567,44 @@ int main (int argc, char* argv[])
         }
         processor.setNaturalVibratoSurfaceDiagnostic (surface);
     }
+    processor.setNegativeNaturalPhaseScaleDiagnostic (negativeNaturalPhaseScale);
+    processor.setControlCalibrationDiagnostic (pitchCentreSeconds,
+                                               wideVibratoNeutralRetention,
+                                               wideVibratoHumanizedRetention);
     processor.prepareToPlay (reader->sampleRate, blockSize);
+    processor.setHardTuneWideTransitionDiagnostic (diagnosticWideTransitionMs,
+                                                   diagnosticWideTransitionDownMs,
+                                                   diagnosticWideTransitionShape);
+    processor.setRapidAdjacentTargetSelectionEnabled (rapidAdjacentTargetSelection);
+    processor.setRendererEpochTraceEnabled (epochTraceEnabled);
+    if (olaTraceStart <= olaTraceEnd)
+        processor.setRendererOlaContributionTraceRange (olaTraceStart, olaTraceEnd);
     processor.setSignalChainDiagnosticEnabled (true);
     CausalTDPSOLARenderer::DiagnosticAblation ablation;
     ablation.waveformAnchoredSourceMarks = waveformAnchoredSourceMarks;
     ablation.phaseContinuousRenderer = phaseContinuousRenderer;
     ablation.phaseForceUnityRatio = phaseForceUnityRatio;
     ablation.phaseForceStaticUpRatio = phaseForceStaticUpRatio;
+    ablation.rapidLegatoReturnPreview = rapidLegatoReturnPreview;
+    ablation.continuousRapidReturnExcursion = continuousRapidReturnExcursion;
+    ablation.preserveSourceCursorDuringTrajectoryExcursion = preserveSourceCursorDuringTrajectoryExcursion;
+    ablation.continuousReturnMinimumCoherentFrames = excursionMinimumCoherentFrames;
+    ablation.continuousReturnMinimumTravelCents = excursionMinimumTravelCents;
+    ablation.continuousReturnHoldMilliseconds = excursionHoldMilliseconds;
+    ablation.slowRetuneInputReferenceAmountOverride = slowRetuneInputReferenceAmountOverride;
+    ablation.targetAwareTailReplacement = targetAwareTailReplacement;
+    ablation.targetAwareTailOnsetHalfWindows = targetAwareTailOnsetHalfWindows;
+    ablation.targetAwareTailFadeHalfWindows = targetAwareTailFadeHalfWindows;
+    ablation.targetAwareOldTailGain = targetAwareOldTailGain;
+    ablation.targetAwareMinimumStepCents = targetAwareMinimumStepCents;
+    ablation.targetAwareNewGrainHammingBlend = targetAwareNewGrainHammingBlend;
+    ablation.targetAwareWindowHalfFactorOverride = targetAwareWindowHalfFactorOverride;
+    ablation.trajectoryExcursionTailReplacement = trajectoryExcursionTailReplacement;
+    ablation.cadenceOwnedExcursionRatio = cadenceOwnedExcursionRatio;
+    ablation.excursionDrivesSynthesisCadence = excursionDrivesSynthesisCadence;
+    ablation.pendingGrainQueue = pendingGrainQueue;
+    ablation.pendingQueueAllFutureAudible = pendingQueueAllFutureAudible;
+    ablation.retimableEpochs = retimableEpochs;
     processor.setRendererDiagnosticAblation (ablation);
     // Explicitly state the shipped default preset for binding audit.
     setParameter (processor, "bypass", 0.0f);
@@ -438,17 +634,23 @@ int main (int argc, char* argv[])
               << ",trajectory\nGroup Octaves,state/state,state,note policy\nNote Map Rules,state/state,state,target selector\n";
 
     juce::AudioBuffer<float> source (static_cast<int> (reader->numChannels), blockSize);
-    // Production AU now exposes a mono vocal path. Feeding a two-channel
-    // buffer here bypasses the host's mono layout negotiation and can leave
-    // the renderer grain-starved, producing a misleading dry benchmark.
-    juce::AudioBuffer<float> output (1, blockSize);
+    // The direct diagnostic normally uses the mono vocal path. A StudioForge
+    // VST3 insert, however, is hosted in a canonical stereo track buffer even
+    // when its source WAV is mono. Make that topology selectable so that a
+    // selector/renderer trace can be compared to the actual host without
+    // changing the production processor or its signal path.
+    const auto* stereoHostValue = std::getenv ("VIBE_DIAGNOSTIC_STEREO_HOST");
+    const auto emulateStereoHost = stereoHostValue != nullptr
+                                && std::atoi (stereoHostValue) != 0;
+    const auto renderChannels = emulateStereoHost ? 2 : 1;
+    juce::AudioBuffer<float> output (renderChannels, blockSize);
     // The production WAV is written as a stream. Retaining a second full
     // stereo copy is useful only for the short sample-level forensic trace;
     // on a long raw vocal it needlessly exhausts memory before the actual
     // listenable export is complete.
-    const auto retainFullOutputForForensics = reader->lengthInSamples <= static_cast<int64_t> (30 * reader->sampleRate);
+    const auto retainFullOutputForForensics = sourceSampleLimit <= static_cast<int64_t> (30 * reader->sampleRate);
     juce::AudioBuffer<float> fullDefaultOutput (1, retainFullOutputForForensics
-                                                    ? static_cast<int> (reader->lengthInSamples) : 0);
+                                                    ? static_cast<int> (sourceSampleLimit) : 0);
     juce::MidiBuffer midi;
     std::vector<VibeAutotuneProcessor::SignalChainDiagnosticFrame> frames (16);
     std::vector<VibeAutotuneProcessor::SignalChainDiagnosticFrame> allDiagnosticFrames;
@@ -456,15 +658,48 @@ int main (int argc, char* argv[])
     auto previousCommittedTarget = -2;
     double previousSpawnEpoch = -1.0;
     float previousWet = 0.0f;
+    float previousCallbackOutput = 0.0f;
+    bool hasPreviousCallbackOutput = false;
+    double maximumCallbackBoundaryStep = 0.0;
+    int64_t maximumCallbackBoundarySample = -1;
 
-    for (int64_t position = 0; position < reader->lengthInSamples; position += blockSize)
+    auto sequenceIndex = size_t { 0 };
+    for (int64_t position = 0; position < sourceSampleLimit;)
     {
-        const auto count = static_cast<int> (juce::jmin<int64_t> (blockSize, reader->lengthInSamples - position));
+        const auto requestedBlockSize = blockSequence.empty()
+                                      ? blockSize
+                                      : blockSequence[sequenceIndex++ % blockSequence.size()];
+        const auto count = static_cast<int> (juce::jmin<int64_t> (requestedBlockSize, sourceSampleLimit - position));
+        // The processor must see the actual final callback length.  Passing
+        // the preallocated capacity here zero-pads EOS and can conceal a
+        // retained 1..63 sample source-stage tail.
+        source.setSize (static_cast<int> (reader->numChannels), count, false, false, true);
+        output.setSize (renderChannels, count, false, false, true);
         source.clear(); output.clear();
         reader->read (&source, 0, count, position, true, true);
         for (int sample = 0; sample < count; ++sample)
-            output.setSample (0, sample, source.getSample (0, sample));
+        {
+            const auto input = source.getSample (0, sample);
+            output.setSample (0, sample, input);
+            if (renderChannels == 2)
+                output.setSample (1, sample, input);
+        }
         processor.processBlock (output, midi);
+        if (count > 0 && hasPreviousCallbackOutput)
+        {
+            const auto boundaryStep = std::abs (static_cast<double> (output.getSample (0, 0)
+                                                                      - previousCallbackOutput));
+            if (boundaryStep > maximumCallbackBoundaryStep)
+            {
+                maximumCallbackBoundaryStep = boundaryStep;
+                maximumCallbackBoundarySample = position;
+            }
+        }
+        if (count > 0)
+        {
+            previousCallbackOutput = output.getSample (0, count - 1);
+            hasPreviousCallbackOutput = true;
+        }
         renderedWriter->writeFromAudioSampleBuffer (output, 0, count);
         if (retainFullOutputForForensics)
             fullDefaultOutput.copyFrom (0, static_cast<int> (position), output, 0, 0, count);
@@ -508,6 +743,97 @@ int main (int argc, char* argv[])
             previousVoiced = f.voiced; previousActive = f.correctionIsActive;
             previousTargetBridge = f.targetBridge; previousTransientBridge = f.transientBridge; previousWet = f.dryWetMix;
         }
+        position += count;
+    }
+
+    if (epochTraceEnabled)
+    {
+        std::array<CausalTDPSOLARenderer::EpochTrace, CausalTDPSOLARenderer::epochTraceCapacity> epochTraces {};
+        const auto traceCount = processor.copyRendererEpochTraces (epochTraces.data(), static_cast<int> (epochTraces.size()));
+        std::ofstream epochCsv (outputDirectory.getChildFile ("renderer_epoch_trace.csv").getFullPathName().toStdString());
+        epochCsv << "sequence,decisionSourceSample,sourceScheduleSample,pendingSynthesisMarkBefore,pendingSynthesisMarkAfter,sourceMarkCursorBefore,sourceMarkCursorAfter,selectedMark,synthesisMark,halfWindow,firstAudible,controlTimestamp,controlPublicationSample,targetEventId,fallbackControlTimestamp,fallbackControlPublicationSample,fallbackTargetEventId,pendingCandidateId,sealSample,ticketIssueSample,pendingFinalizationSample,synthPhaseBefore,synthPhaseAfter,sourcePeriod,effectiveSynthesisPeriod,ratio,fallbackRatio,retimeSamples,deferred,retimed,finalized\n";
+        for (int i = 0; i < traceCount; ++i)
+        {
+            const auto& t = epochTraces[static_cast<size_t> (i)];
+            epochCsv << t.sequence << ',' << t.decisionSourceSample << ',' << t.sourceScheduleSample << ','
+                     << t.pendingSynthesisMarkBefore << ',' << t.pendingSynthesisMarkAfter << ','
+                     << t.sourceMarkCursorBefore << ',' << t.sourceMarkCursorAfter << ','
+                     << t.selectedMark << ',' << t.synthesisMark << ',' << t.halfWindow << ',' << t.firstAudible << ','
+                     << t.controlTimestamp << ',' << t.controlPublicationSample << ',' << t.targetEventId << ','
+                     << t.fallbackControlTimestamp << ',' << t.fallbackControlPublicationSample << ',' << t.fallbackTargetEventId << ','
+                     << t.pendingCandidateId << ',' << t.sealSample << ',' << t.ticketIssueSample << ',' << t.pendingFinalizationSample << ','
+                     << t.synthPhaseBefore << ',' << t.synthPhaseAfter << ',' << t.sourcePeriod << ','
+                     << t.effectiveSynthesisPeriod << ',' << t.ratio << ',' << t.fallbackRatio << ',' << t.retimeSamples << ','
+                     << t.deferred << ',' << t.retimed << ',' << t.finalized << '\n';
+        }
+    }
+    if (olaTraceStart <= olaTraceEnd)
+    {
+        std::vector<CausalTDPSOLARenderer::OlaContributionTrace> olaTraces (65536);
+        const auto traceCount = processor.copyRendererOlaContributionTraces (olaTraces.data(), static_cast<int> (olaTraces.size()));
+        std::ofstream olaCsv (outputDirectory.getChildFile ("renderer_ola_contribution_trace.csv").getFullPathName().toStdString());
+        olaCsv << "grainId,targetEventId,controlTimestamp,correctionGeneration,synthesisMark,halfWindow,destinationSample,sourceMark,ratio,numeratorContribution,weightContribution\n";
+        for (int i = 0; i < traceCount; ++i)
+        {
+            const auto& t = olaTraces[static_cast<size_t> (i)];
+            olaCsv << t.grainId << ',' << t.targetEventId << ',' << t.controlTimestamp << ','
+                   << t.correctionGeneration << ',' << t.synthesisMark << ',' << t.halfWindow << ','
+                   << t.destinationSample << ',' << t.sourceMark << ',' << t.ratio << ','
+                   << t.numeratorContribution << ',' << t.weightContribution << '\n';
+        }
+    }
+
+    // This sidecar is a write-time trace, not an output-time sampling. It is
+    // deliberately separate from full_default_intervals.csv so a reviewer
+    // can see whether update(), advance(128), and push() were ordered as
+    // expected at a reversal.
+    std::vector<VibeAutotuneProcessor::ControlMaterializationEvent> materializations (
+        static_cast<size_t> (VibeAutotuneProcessor::controlMaterializationEventCapacity));
+    const auto materializationCount = processor.copyControlMaterializationEvents (
+        materializations.data(), static_cast<int> (materializations.size()));
+    std::ofstream materializationCsv (
+        outputDirectory.getChildFile ("control_materialization_events.csv").getFullPathName().toStdString());
+    materializationCsv << "sequence,timestampSamples,timeMs,targetEventId,targetEventTimestampSamples,publishedAtInputSample,publicationDelaySamples,hostBlockStart,hostBlockEnd,publishedToPsolaRing,advanceSamples,transitionStartCents,transitionTargetCents,transitionProgress,transitionDurationMs,correctionBeforeAdvance,correctionAfterAdvance,scheduledRatio,scheduledCorrectionCents\n";
+    for (int index = 0; index < materializationCount; ++index)
+    {
+        const auto& event = materializations[static_cast<size_t> (index)];
+        materializationCsv << event.sequence << ',' << event.timestampSamples << ','
+                           << (1000.0 * static_cast<double> (event.timestampSamples) / reader->sampleRate) << ','
+                           << event.targetEventId << ',' << event.targetEventTimestampSamples << ','
+                           << event.publishedAtInputSample << ','
+                           << (static_cast<int64_t> (event.publishedAtInputSample) - static_cast<int64_t> (event.timestampSamples)) << ','
+                           << event.hostBlockStartSample << ',' << event.hostBlockEndSample << ','
+                           << event.publishedToPsolaRing << ',' << event.controlAdvanceSamples << ',' << event.transitionStartCents << ','
+                           << event.transitionTargetCents << ',' << event.transitionProgress << ','
+                           << event.transitionDurationMs << ',' << event.correctionBeforeAdvance << ','
+                           << event.correctionAfterAdvance << ',' << event.scheduledRatio << ','
+                           << event.scheduledCorrectionCents << '\n';
+    }
+
+    std::array<VibeAutotuneProcessor::RendererControlLookupTrace,
+               VibeAutotuneProcessor::rendererControlLookupTraceCapacity> lookupTraces {};
+    const auto lookupTraceCount = processor.copyRendererControlLookupTraces (
+        lookupTraces.data(), static_cast<int> (lookupTraces.size()));
+    std::ofstream lookupTraceCsv (
+        outputDirectory.getChildFile ("renderer_control_lookup_ring_trace.csv").getFullPathName().toStdString());
+    lookupTraceCsv << "queryTimestamp,lookupRole,writeIndex,foundBefore,foundAfter,interpolationEligible,interpolationApplied,interpolationT,beforeTimestamp,beforeSequence,beforeRatio,beforeCorrection,beforeEvent,afterTimestamp,afterSequence,afterRatio,afterCorrection,afterEvent,returnedTimestamp,returnedSequence,returnedRatio,returnedCorrection,returnedEvent,ringIndex,written,insertionSequence,timestamp,ratio,correction,targetEventId,valid,holdDry\n";
+    for (int traceIndex = 0; traceIndex < lookupTraceCount; ++traceIndex)
+    {
+        const auto& trace = lookupTraces[static_cast<size_t> (traceIndex)];
+        for (const auto& entry : trace.ring)
+            lookupTraceCsv << trace.queryTimestampSamples << ',' << static_cast<int> (trace.lookupRole) << ',' << trace.psolaControlWriteIndex << ','
+                           << trace.foundBefore << ',' << trace.foundAfter << ','
+                           << trace.interpolationEligible << ',' << trace.interpolationApplied << ','
+                           << trace.interpolationT << ','
+                           << trace.before.timestampSamples << ',' << trace.before.insertionSequence << ','
+                           << trace.before.pitchRatio << ',' << trace.before.correctionCents << ',' << trace.before.targetEventId << ','
+                           << trace.after.timestampSamples << ',' << trace.after.insertionSequence << ','
+                           << trace.after.pitchRatio << ',' << trace.after.correctionCents << ',' << trace.after.targetEventId << ','
+                           << trace.returned.timestampSamples << ',' << trace.returned.insertionSequence << ','
+                           << trace.returned.pitchRatio << ',' << trace.returned.correctionCents << ',' << trace.returned.targetEventId << ','
+                           << entry.ringIndex << ',' << entry.written << ',' << entry.insertionSequence << ','
+                           << entry.timestampSamples << ',' << entry.pitchRatio << ',' << entry.correctionCents << ','
+                           << entry.targetEventId << ',' << entry.valid << ',' << entry.holdDry << '\n';
     }
 
     // Sample-resolution forensic trace for the legato onset under audit.
@@ -576,7 +902,34 @@ int main (int argc, char* argv[])
     std::cout << "full_default,target_commits=" << data.targetSwitchCount
               << ",dry_bridges=" << data.dryBridgeCount
               << ",max_trajectory_step_ct=" << data.maxTrajectoryStepCents
-              << ",max_renderer_step_ct=" << data.maxRendererStepCents << '\n';
+              << ",max_renderer_step_ct=" << data.maxRendererStepCents
+              << ",pending_deadline_misses=" << processor.getRendererPendingDeadlineMissCount()
+              << ",late_candidate_creation=" << processor.getRendererLateCandidateCreationCount()
+              << ",late_ola_writes=" << processor.getRendererLateOlaWriteCount()
+              << ",pending_queue_peak=" << processor.getRendererPendingQueuePeakOccupancy()
+              << ",pending_queue_overflow=" << processor.getRendererPendingQueueOverflowCount()
+              << ",retimable_epoch_peak=" << processor.getRendererRetimableEpochPeakOccupancy()
+              << ",epoch_retimes=" << processor.getRendererEpochRetimeCount()
+              << ",retimed_samples_total=" << processor.getRendererRetimedSamplesTotal()
+              << ",max_single_epoch_retime=" << processor.getRendererMaxSingleEpochRetime()
+              << ",retime_deadline_misses=" << processor.getRendererRetimeDeadlineMissCount()
+              << ",epoch_order_violations=" << processor.getRendererEpochOrderViolationCount()
+              << ",ticket_issued_past_deadline=" << processor.getRendererTicketIssuedPastDeadlineCount()
+              << ",ticket_mutation_after_issue=" << processor.getRendererTicketMutationAfterIssueCount() << '\n';
+    const auto scheduler = processor.getSourceSchedulerDiagnostics();
+    std::cout << "source_scheduler,received=" << scheduler.sourceSamplesReceived
+              << ",scheduled=" << scheduler.sourceSamplesScheduled
+              << ",quantums=" << scheduler.quantumsScheduled
+              << ",stage_fill=" << scheduler.partialStageFill
+              << ",drops=" << scheduler.sourceDropCount
+              << ",duplicates=" << scheduler.sourceDuplicateCount
+              << ",gaps=" << scheduler.schedulerGapCount
+              << ",overlaps=" << scheduler.schedulerOverlapCount
+              << ",max_output_ahead_at_planner=" << scheduler.maximumOutputAheadAtSourcePlanner
+              << ",max_output_advance_between_planners=" << scheduler.maximumOutputAdvanceBetweenSourcePlanners
+              << '\n';
+    std::cout << "callback_boundary,max_step=" << maximumCallbackBoundaryStep
+              << ",sample=" << maximumCallbackBoundarySample << '\n';
     if (retainFullOutputForForensics)
         writeMetric (metrics, "J_full_default", measure (fullDefaultOutput), rendererLatencySamples,
                      "production path; target commits and bridge counts in diagnostic summary");
@@ -585,5 +938,15 @@ int main (int argc, char* argv[])
                 << ",production path streamed to WAV\n";
     std::cout << "csv=" << outputDirectory.getChildFile ("full_default_intervals.csv").getFullPathName() << '\n';
     std::cout << "events=" << outputDirectory.getChildFile ("full_default_events.csv").getFullPathName() << '\n';
+    std::cout << "control_materialization="
+              << outputDirectory.getChildFile ("control_materialization_events.csv").getFullPathName() << '\n';
+    std::cout << "renderer_control_lookup_ring_trace="
+              << outputDirectory.getChildFile ("renderer_control_lookup_ring_trace.csv").getFullPathName() << '\n';
+    if (epochTraceEnabled)
+        std::cout << "renderer_epoch_trace="
+                  << outputDirectory.getChildFile ("renderer_epoch_trace.csv").getFullPathName() << '\n';
+    if (olaTraceStart <= olaTraceEnd)
+        std::cout << "renderer_ola_contribution_trace="
+                  << outputDirectory.getChildFile ("renderer_ola_contribution_trace.csv").getFullPathName() << '\n';
     std::cout << "render=" << renderedFile.getFullPathName() << '\n';
 }

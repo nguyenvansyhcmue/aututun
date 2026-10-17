@@ -2,6 +2,7 @@
 #include "PluginEditor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 
 namespace
@@ -9,12 +10,50 @@ namespace
 constexpr double yinThreshold = 0.15;
 constexpr float silenceThreshold = 0.0001f;
 constexpr int maximumPitchAnalysisFrameSize = 2048;
-constexpr int rendererControlIntervalSamples = 128;
+// The shipped renderer keeps its 128-sample cadence. A separate offline
+// build may override this compile-time value to measure control bandwidth;
+// it is not a public parameter and it never changes the released binary.
+#ifndef VIBE_RENDERER_CONTROL_INTERVAL_SAMPLES
+ #define VIBE_RENDERER_CONTROL_INTERVAL_SAMPLES 128
+#endif
+constexpr int rendererControlIntervalSamples = VIBE_RENDERER_CONTROL_INTERVAL_SAMPLES;
+// Offline renderer A/B only. The released component remains spectral.
+#ifndef VIBE_USE_CAUSAL_TDPSOLA_RENDERER_CANDIDATE
+ #define VIBE_USE_CAUSAL_TDPSOLA_RENDERER_CANDIDATE 0
+#endif
+
+// Offline A/B only. -1 preserves the released dynamic margin (two source
+// quanta); non-negative values control when a future TD-PSOLA grain becomes
+// immutable. This never changes selector or public parameter behaviour.
+#ifndef VIBE_TDPSOLA_PLANNER_HANDOFF_MARGIN_SAMPLES
+ #define VIBE_TDPSOLA_PLANNER_HANDOFF_MARGIN_SAMPLES -1
+#endif
+
+// Offline Studio-quality A/B only. The normal component retains 1152
+// samples; a larger value gives retimable TD-PSOLA epochs real future
+// control evidence and is reported to the host for correct PDC.
+#ifndef VIBE_TDPSOLA_LATENCY_SAMPLES
+ #define VIBE_TDPSOLA_LATENCY_SAMPLES 1152
+#endif
+
+// Candidate-only hook.  The shipped value remains two control ticks; an
+// offline build may measure whether a single certified hard-tune tick closes
+// short-note misses without changing the selector or any public control.
+#ifndef VIBE_HARD_TUNE_ENGAGE_CONTROL_FRAMES
+ #define VIBE_HARD_TUNE_ENGAGE_CONTROL_FRAMES 2
+#endif
+
 constexpr double rendererControlDezipperFastSeconds = 0.006;
 constexpr double rendererControlDezipperSlowSeconds = 0.032;
 // Measured against the Artist F#4 control fixture. The spectral renderer
 // needs 9.6% extra control cents to deliver the requested steady correction.
 constexpr double rendererDeliveryGain = 1.096;
+// Offline calibration hook for the causal TD-PSOLA candidate. Production
+// remains unity until Artist-reference and realtime qualification pass.
+#ifndef VIBE_TDPSOLA_DELIVERY_GAIN
+ #define VIBE_TDPSOLA_DELIVERY_GAIN 1.0
+#endif
+
 // Exact 0 ms has its own faster renderer automation path. It remains
 // de-zipped (rather than a discontinuous ratio write) but reaches a target
 // perceptibly sooner than the normal continuous Retune range.
@@ -44,6 +83,24 @@ constexpr double rendererMaximumContinuousStepCents = 6.0;
 // one-semitone 0 ms landing into a 20+ ms pitch ramp.
 constexpr double rendererMaximumHardTuneStepCents = 120.0;
 
+double rendererDeliveryRailCents (double retuneSpeedMs, double flexTunePercent,
+                                  double humanizePercent, double naturalVibratoPercent) noexcept
+{
+    constexpr auto zeroTolerance = 0.05;
+    const auto hardTune = retuneSpeedMs <= zeroTolerance
+                       && flexTunePercent <= zeroTolerance
+                       && humanizePercent <= zeroTolerance
+                       && std::abs (naturalVibratoPercent) <= zeroTolerance;
+    const auto hasNaturalVibrato = std::abs (naturalVibratoPercent) > zeroTolerance;
+    if (hardTune)
+        return VIBE_HARD_LOCK_MAXIMUM_LIVE_CORRECTION_CENTS;
+
+    return retuneSpeedMs <= VIBE_MUSICAL_RAIL_MAX_RETUNE_MS
+        && ! hasNaturalVibrato
+        ? VIBE_MUSICAL_MAXIMUM_LIVE_CORRECTION_CENTS
+        : 120.0;
+}
+
 constexpr std::array<std::array<bool, 12>, 14> scaleIntervals {{
     {{ true, true, true, true, true, true, true, true, true, true, true, true }},   // Chromatic
     {{ true, false, true, false, true, true, false, true, false, true, false, true }}, // Major
@@ -51,8 +108,8 @@ constexpr std::array<std::array<bool, 12>, 14> scaleIntervals {{
     {{ true, false, true, false, true, false, false, true, false, true, false, false }}, // Major pentatonic
     {{ true, false, false, true, false, true, false, true, false, false, true, false }}, // Minor pentatonic
     {{ true, false, true, true, false, true, false, true, true, false, false, true }}, // Harmonic minor
-    {{ true, false, true, true, false, true, false, true, true, false, true, false }}, // Melodic minor
-    {{ true, false, true, true, false, true, false, true, true, false, true, false }}, // Dorian
+    {{ true, false, true, true, false, true, false, true, false, true, false, true }}, // Melodic minor (ascending)
+    {{ true, false, true, false, true, true, false, true, false, true, true, false }}, // Dorian
     {{ true, true, false, true, false, true, false, true, true, false, true, false }}, // Phrygian
     {{ true, false, true, false, true, false, true, true, false, true, false, true }}, // Lydian
     {{ true, false, true, false, true, true, false, true, false, true, true, false }}, // Mixolydian
@@ -87,6 +144,21 @@ VibeAutotuneProcessor::VibeAutotuneProcessor()
     for (auto& hasOverride : midiNoteHasOverride)
         hasOverride.store (false, std::memory_order_relaxed);
     resetNotePolicyToScale (0, 0);
+#if VIBE_TARGET_AWARE_TAIL_TEST
+    // A/B component only. The public four controls and selector are kept
+    // untouched; this turns on one fixed renderer candidate so Logic capture
+    // compares the same preset against the ordinary component.
+    CausalTDPSOLARenderer::DiagnosticAblation tailTest;
+    tailTest.phaseContinuousRenderer = false;
+    tailTest.targetAwareTailReplacement = true;
+    tailTest.targetAwareTailOnsetHalfWindows = 0.0;
+    tailTest.targetAwareTailFadeHalfWindows = 0.25;
+    tailTest.targetAwareOldTailGain = 1.0;
+    tailTest.targetAwareMinimumStepCents = 50.0;
+    tailTest.targetAwareNewGrainHammingBlend = 0.0;
+    tailTest.targetAwareWindowHalfFactorOverride = 0.60;
+    setRendererDiagnosticAblation (tailTest);
+#endif
 }
 
 bool VibeAutotuneProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -104,33 +176,53 @@ juce::AudioProcessorValueTreeState::ParameterLayout VibeAutotuneProcessor::creat
     using Choice = juce::AudioParameterChoice;
     using Bool = juce::AudioParameterBool;
     using Range = juce::NormalisableRange<float>;
+    using FloatAttributes = juce::AudioParameterFloatAttributes;
 
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
     layout.add (std::make_unique<Bool> (juce::ParameterID { "bypass", 1 }, "Bypass", false));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "retuneSpeed", 1 }, "Retune Speed", Range (0.0f, 400.0f, 0.1f), 100.0f, "ms"));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "correctionAmount", 1 }, "Correction Amount", Range (0.0f, 100.0f, 0.1f), 100.0f, "%"));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "retuneSpeed", 1 }, "Retune Speed", Range (0.0f, 400.0f, 0.1f), 100.0f, FloatAttributes().withLabel ("ms")));
     // A new instance must land exactly on the selected scale note. Flex-Tune
     // is an explicit near-target relaxation, and its old non-zero default
     // made slower Retune settings sound as though they never reached target.
     layout.add (std::make_unique<Parameter> (juce::ParameterID { "flexTune", 1 }, "Flex-Tune", Range (0.0f, 100.0f, 0.1f), 0.0f));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "humanize", 1 }, "Humanize", Range (0.0f, 100.0f, 0.1f), 0.0f, "%"));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "naturalVibrato", 1 }, "Natural Vibrato", Range (-12.0f, 12.0f, 0.1f), 0.0f, " ms"));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "humanize", 1 }, "Humanize", Range (0.0f, 100.0f, 0.1f), 0.0f, FloatAttributes().withLabel ("%")));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "naturalVibrato", 1 }, "Natural Vibrato", Range (-12.0f, 12.0f, 0.1f), 0.0f, FloatAttributes().withLabel (" ms")));
+    // Hidden calibration-only controls. -1 restores the immutable production
+    // knots; StudioForge uses these rather than environment propagation
+    // through the AU host process.
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "diagnosticRetune10T90Ms", 1 }, "Diagnostic Retune 10 T90", Range (-1.0f, 80.0f, 0.1f), -1.0f));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "diagnosticRetune25T90Ms", 1 }, "Diagnostic Retune 25 T90", Range (-1.0f, 140.0f, 0.1f), -1.0f));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "diagnosticFlexResidualScale", 1 }, "Diagnostic Flex Residual", Range (0.5f, 1.5f, 0.01f), 1.0f));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "diagnosticHumanizeScale", 1 }, "Diagnostic Humanize Scale", Range (0.5f, 1.5f, 0.01f), 1.0f));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "diagnosticNegativeNaturalPhaseScale", 1 }, "Diagnostic Natural Phase", Range (0.0f, 2.5f, 0.01f), 1.0f));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "diagnosticNaturalSurfaceHardTuneWeight", 1 }, "Diagnostic Natural Hard Tune Surface", Range (0.0f, 1.0f, 0.01f), 0.0f));
     layout.add (std::make_unique<Choice> (juce::ParameterID { "key", 1 }, "Key", juce::StringArray { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }, 6));
     layout.add (std::make_unique<Choice> (juce::ParameterID { "scale", 1 }, "Scale", juce::StringArray {
         "Chromatic", "Major", "Natural Minor", "Major Pentatonic", "Minor Pentatonic",
         "Harmonic Minor", "Melodic Minor", "Dorian", "Phrygian", "Lydian",
         "Mixolydian", "Locrian", "Minor Blues", "Whole Tone", "User Scale" }, 2));
     layout.add (std::make_unique<Choice> (juce::ParameterID { "inputType", 1 }, "Input Type", juce::StringArray { "Soprano", "Alto", "Tenor", "Low" }, 1));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "transpose", 1 }, "Transpose", Range (-12.0f, 12.0f, 1.0f), 0.0f, "st"));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "referencePitch", 1 }, "Reference Pitch", Range (432.0f, 448.0f, 0.1f), 440.0f, "Hz"));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "tracking", 1 }, "Tracking", Range (0.0f, 100.0f, 1.0f), 50.0f, "%"));
-    layout.add (std::make_unique<Parameter> (juce::ParameterID { "voicedColour", 1 }, "Voiced Colour", Range (0.0f, 100.0f, 0.1f), 0.0f, "%"));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "transpose", 1 }, "Transpose", Range (-12.0f, 12.0f, 1.0f), 0.0f, FloatAttributes().withLabel ("st")));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "referencePitch", 1 }, "Reference Pitch", Range (432.0f, 448.0f, 0.1f), 440.0f, FloatAttributes().withLabel ("Hz")));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "tracking", 1 }, "Tracking", Range (0.0f, 100.0f, 1.0f), 50.0f, FloatAttributes().withLabel ("%")));
+    layout.add (std::make_unique<Parameter> (juce::ParameterID { "voicedColour", 1 }, "Voiced Colour", Range (0.0f, 100.0f, 0.1f), 0.0f, FloatAttributes().withLabel ("%")));
     return layout;
 }
 
 void VibeAutotuneProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    midiHeldNotes.fill (false);
+    midiNoteOrder.fill (0);
+    midiOrderCounter = 0;
+    midiTargetNote.store (-1, std::memory_order_relaxed);
     analysisSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+    // Live production is native 32 samples. The environment override is a
+    // cached diagnostic rollback only; it is never consulted by processBlock.
+    const auto* diagnosticQuantum = std::getenv ("VIBE_SOURCE_SCHEDULER_QUANTUM");
+    activeSourceSchedulerQuantumSamples = diagnosticQuantum != nullptr && std::atoi (diagnosticQuantum) == 64 ? 64 : 32;
+    const auto* retimingOverride = std::getenv ("VIBE_RETIMABLE_EPOCHS");
+    const auto productionRetimingEnabled = retimingOverride == nullptr || std::atoi (retimingOverride) != 0;
+    correctionTrajectory.setDiagnosticRetuneT90Overrides (-1.0, -1.0);
     const auto maximumLag = maximumPitchAnalysisFrameSize / 2 + 2;
     yinDifference.resize (static_cast<size_t> (maximumLag + 1), 0.0);
     yinCumulativeMean.resize (static_cast<size_t> (maximumLag + 1), 0.0);
@@ -139,20 +231,36 @@ void VibeAutotuneProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     pitchAnalysisFifo.resize (maximumPitchAnalysisFrameSize, 0.0f);
     pitchAnalysisFrame.resize (maximumPitchAnalysisFrameSize, 0.0f);
     rawPitchAnalysisFrame.resize (maximumPitchAnalysisFrameSize, 0.0f);
-    psolaMaximumBlockSize = samplesPerBlock;
+    psolaMaximumBlockSize = juce::jmax (samplesPerBlock, activeSourceSchedulerQuantumSamples);
     psolaMaximumChannels = juce::jlimit (1, 2, getTotalNumInputChannels());
-    constexpr auto tdpsolaLatencySamples = 1152;
+    constexpr auto tdpsolaLatencySamples = VIBE_TDPSOLA_LATENCY_SAMPLES;
     for (auto& renderer : tdpsolaRenderers)
+    {
         renderer.prepare (analysisSampleRate, psolaMaximumBlockSize, tdpsolaLatencySamples);
-    // Production intentionally keeps the renderer's native TD-PSOLA setup.
-    // Waveform-anchored marks and trajectory-following source marks are
-    // diagnostic experiments; on a real vocal they can turn a residual
-    // cycle into an exposed second voice. They must never be enabled merely
-    // because they improve a synthetic contour measurement.
-    usePhaseContinuousRenderer = false;
+        // The release margin is one active source quantum plus at most one
+        // partial output lead. A non-negative offline override measures only
+        // the grain commitment horizon; it cannot alter target selection.
+        const auto plannerHandoffMargin = VIBE_TDPSOLA_PLANNER_HANDOFF_MARGIN_SAMPLES >= 0
+                                      ? VIBE_TDPSOLA_PLANNER_HANDOFF_MARGIN_SAMPLES
+                                      : 2 * activeSourceSchedulerQuantumSamples;
+        renderer.setPlannerHandoffMarginSamples (static_cast<uint64_t> (plannerHandoffMargin));
+        CausalTDPSOLARenderer::DiagnosticAblation productionAblation;
+        productionAblation.retimableEpochs = productionRetimingEnabled;
+        renderer.setDiagnosticAblation (productionAblation);
+    }
+    // The TD-PSOLA renderer remains available for controlled diagnostics,
+    // but it is not a safe production path yet: a live host can exercise
+    // callback timing that the experimental grain scheduler does not own.
+    // The spectral renderer has fixed storage and a fixed latency contract,
+    // so it is the production live path until TD-PSOLA has equivalent
+    // real-device stress coverage.
+    usePhaseContinuousRenderer.store (! VIBE_USE_CAUSAL_TDPSOLA_RENDERER_CANDIDATE, std::memory_order_release);
     for (auto& renderer : phaseContinuousRenderers)
         renderer.prepare (analysisSampleRate, psolaMaximumBlockSize);
-    rendererLatencySamples = phaseContinuousRenderers[0].latencySamples();
+    // A TD-PSOLA quality candidate must expose the same latency to its
+    // control stream and host PDC as it gives its output FIFO.
+    rendererLatencySamples = VIBE_USE_CAUSAL_TDPSOLA_RENDERER_CANDIDATE
+                           ? tdpsolaLatencySamples : phaseContinuousRenderers[0].latencySamples();
     rendererControlDelaySamples = rendererLatencySamples;
     rendererInput.resize (static_cast<size_t> (psolaMaximumBlockSize * psolaMaximumChannels), 0.0f);
     phaseContinuousRendererOutput.resize (static_cast<size_t> (psolaMaximumBlockSize * psolaMaximumChannels), 0.0f);
@@ -169,6 +277,10 @@ void VibeAutotuneProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     maximumTrajectoryStepCents.store (0.0f, std::memory_order_relaxed);
     maximumRendererStepCents.store (0.0f, std::memory_order_relaxed);
     correctionTrajectory.reset();
+    // Listening-build default: evaluate the bounded adjacent-note predictor
+    // on the live hard-tune path. It does not alter TD-PSOLA timing, OLA, or
+    // latency; this switch exists solely to audition target timing.
+    correctionTrajectory.setRapidAdjacentTargetSelectionEnabled (true);
     noteTransition.reset();
     latestCorrectionTrajectory = {};
     resetPsolaRenderer();
@@ -203,10 +315,17 @@ void VibeAutotuneProcessor::clearPitchMonitor (bool bypassed)
 
 VibeAutotuneProcessor::PitchAnalysisConfig VibeAutotuneProcessor::getPitchAnalysisConfig (int inputType) const noexcept
 {
+    // Diagnostic-only compile-time probe. Defaults preserve the released Alto contract.
+#ifndef VIBE_ALTO_ANALYSIS_FRAME_SAMPLES
+#define VIBE_ALTO_ANALYSIS_FRAME_SAMPLES 2048
+#endif
+#ifndef VIBE_ALTO_ANALYSIS_HOP_SAMPLES
+#define VIBE_ALTO_ANALYSIS_HOP_SAMPLES 256
+#endif
     switch (juce::jlimit (0, 3, inputType))
     {
         case 0: return { 1024, 512, 180.0, 1100.0, 0 };
-        case 1: return { 2048, 256, 110.0, 700.0, 1 };
+        case 1: return { VIBE_ALTO_ANALYSIS_FRAME_SAMPLES, VIBE_ALTO_ANALYSIS_HOP_SAMPLES, 110.0, 700.0, 1 };
         case 2: return { 2048, 512, 80.0, 500.0, 2 };
         case 3: return { 2048, 1024, 55.0, 300.0, 3 };
         default: break;
@@ -276,6 +395,11 @@ NotePolicySnapshot VibeAutotuneProcessor::makeNotePolicySnapshot() const noexcep
 {
     NotePolicySnapshot snapshot;
     snapshot.groupOctaves = groupOctaves.load (std::memory_order_relaxed);
+    // Voice is both an analyser profile and a musical target range. The
+    // immutable snapshot keeps this UI-to-audio handoff realtime-safe.
+    snapshot.targetRange = vocalTargetRangeForInputType (static_cast<int> (
+        parameters.getRawParameterValue ("inputType")->load (std::memory_order_relaxed)));
+    snapshot.midiTargetNote = midiTargetNote.load (std::memory_order_relaxed);
     for (int pitchClass = 0; pitchClass < 12; ++pitchClass)
         snapshot.pitchClassDefaults[static_cast<size_t> (pitchClass)] = noteRuleFromValue (
             pitchClassDefaultPolicy[static_cast<size_t> (pitchClass)].load (std::memory_order_relaxed));
@@ -337,6 +461,8 @@ void VibeAutotuneProcessor::publishPitchTrackingData (double rawF0Hz, double sta
 void VibeAutotuneProcessor::resetPsolaRenderer() noexcept
 {
     psolaControlWriteIndex = 0;
+    psolaControlInsertionSequence = 0;
+    controlMaterializationEventCount = 0;
     psolaTargetEventId = 0;
     psolaTargetEventTimestampSamples = 0;
     for (auto& frame : psolaControlFrames)
@@ -365,6 +491,17 @@ void VibeAutotuneProcessor::resetPitchRenderer() noexcept
     previousRendererOutputSample = 0.0f;
     hasPreviousRendererOutputSample = false;
     std::fill (rendererInput.begin(), rendererInput.end(), 0.0f);
+    sourceStageFill = 0;
+    sourceStageStartSample = processedInputSamples;
+    sourceSamplesReceived = 0;
+    sourceSamplesScheduled = 0;
+    sourceQuantumsScheduled = 0;
+    sourceDropCount = 0;
+    sourceDuplicateCount = 0;
+    schedulerGapCount = 0;
+    schedulerOverlapCount = 0;
+    nextScheduledSourceSample = processedInputSamples;
+    sourceStage.fill (0.0f);
 }
 
 void VibeAutotuneProcessor::processPitchRenderer (juce::AudioBuffer<float>& buffer,
@@ -373,7 +510,11 @@ void VibeAutotuneProcessor::processPitchRenderer (juce::AudioBuffer<float>& buff
                                                          double outputStableF0Hz,
                                                          bool inputPsolaVoiced, double inputPitchRatio,
                                                          double inputStableF0Hz,
-                                                         double inputCommittedTargetHz) noexcept
+                                                         double inputCommittedTargetHz,
+                                                         uint64_t canonicalSourceControlTime,
+                                                         uint64_t outputControlTime,
+                                                         const float* const* stagedSource,
+                                                         int stagedSourceSamples) noexcept
 {
     const auto channels = buffer.getNumChannels();
     const auto samples = sampleCount;
@@ -418,12 +559,12 @@ void VibeAutotuneProcessor::processPitchRenderer (juce::AudioBuffer<float>& buff
 
     // TD-PSOLA consumes source-time F0/ratio and owns the latency-aligned
     // dry fallback plus equal-power gate handoff.
-    const auto sourceRatio = phaseForceUnityRatioForDiagnostic ? 1.0
-                           : phaseForceStaticUpRatioForDiagnostic ? std::exp2 (1.0 / 12.0)
+    const auto sourceRatio = phaseForceUnityRatioForDiagnostic.load (std::memory_order_relaxed) ? 1.0
+                           : phaseForceStaticUpRatioForDiagnostic.load (std::memory_order_relaxed) ? std::exp2 (1.0 / 12.0)
                            : inputPsolaVoiced ? inputPitchRatio : 1.0;
     const auto sourceF0 = inputPsolaVoiced ? inputStableF0Hz
                                            : std::numeric_limits<double>::quiet_NaN();
-    if (usePhaseContinuousRenderer)
+    if (usePhaseContinuousRenderer.load (std::memory_order_acquire))
     {
         for (int channel = 0; channel < channels; ++channel)
         {
@@ -431,7 +572,7 @@ void VibeAutotuneProcessor::processPitchRenderer (juce::AudioBuffer<float>& buff
                                     + static_cast<size_t> (channel * psolaMaximumBlockSize);
             phaseContinuousRenderers[static_cast<size_t> (channel)].process (
                 inputPointers[static_cast<size_t> (channel)], alternativeOutput, samples,
-                sourceRatio, outputCorrectionActive);
+                sourceRatio, outputCorrectionActive, sourceF0);
             std::copy_n (alternativeOutput, samples, outputPointers[static_cast<size_t> (channel)]);
         }
     }
@@ -443,8 +584,15 @@ void VibeAutotuneProcessor::processPitchRenderer (juce::AudioBuffer<float>& buff
         // latency-delayed control which describes audio becoming audible now.
         // Feeding the delayed stream here was the reason its note handoffs
         // could be clean yet land on an already superseded target.
-        const auto sourceControlTime = processedInputSamples + static_cast<uint64_t> (startSample);
-        const auto sourceControl = getRendererControlFrame (sourceControlTime);
+        // The caller owns the single source/control coordinate. Do not
+        // reconstruct it from `processedInputSamples`: analysis mutates that
+        // member before this renderer pass, which previously skewed this
+        // lookup by one host block.
+        const auto sourceControlTime = canonicalSourceControlTime;
+        const auto outputStateControlTime = outputControlTime != 0 ? outputControlTime : sourceControlTime;
+        const auto sourceControl = getRendererControlFrame (sourceControlTime, 2);
+        debugRendererControlLookupTime = sourceControlTime;
+        debugRendererControl = sourceControl;
         const auto sourceControlValid = sourceControl.valid && ! sourceControl.holdDry
                                      && std::isfinite (sourceControl.stableF0Hz)
                                      && sourceControl.stableF0Hz > 0.0
@@ -455,12 +603,53 @@ void VibeAutotuneProcessor::processPitchRenderer (juce::AudioBuffer<float>& buff
                                         * std::exp2 ((static_cast<double> (sourceControl.targetMidi) - 69.0) / 12.0)
                                   : std::numeric_limits<double>::quiet_NaN();
         for (int channel = 0; channel < channels; ++channel)
-            tdpsolaRenderers[static_cast<size_t> (channel)].process (
-                inputPointers[static_cast<size_t> (channel)], outputPointers[static_cast<size_t> (channel)], samples,
-                sourceControlValid ? sourceControl.stableF0Hz : sourceF0,
-                sourceControlValid ? sourceControl.pitchRatio : sourceRatio,
-                sourceControlValid, false, sourceTargetHz,
-                sourceControlValid ? sourceControl.residualPitchCents : 0.0);
+        {
+            auto& renderer = tdpsolaRenderers[static_cast<size_t> (channel)];
+            const auto schedulerF0 = sourceControlValid ? sourceControl.stableF0Hz : sourceF0;
+            const auto schedulerRatio = sourceControlValid ? sourceControl.pitchRatio : sourceRatio;
+            // Output state is materialized independently before ingestion.
+            // Phase 2B can therefore read an output span without requiring a
+            // source scheduler quantum in that same host callback.
+            // Output span state is independent from ingestion, but it must
+            // observe the control already causally materialised for this
+            // source quantum.  `outputStateControlTime` is retained for
+            // provenance; it must not expose a later source control.
+            juce::ignoreUnused (outputStateControlTime);
+            const auto outputControl = sourceControl;
+            const auto outputControlValid = outputControl.valid && ! outputControl.holdDry
+                                         && std::isfinite (outputControl.stableF0Hz)
+                                         && outputControl.stableF0Hz > 0.0
+                                         && std::isfinite (outputControl.pitchRatio);
+            const auto outputTargetHz = outputControlValid && outputControl.targetMidi >= 0
+                                      ? static_cast<double> (parameters.getRawParameterValue ("referencePitch")
+                                                                   ->load (std::memory_order_relaxed))
+                                            * std::exp2 ((static_cast<double> (outputControl.targetMidi) - 69.0) / 12.0)
+                                      : std::numeric_limits<double>::quiet_NaN();
+            const auto outputState = renderer.prepareOutputRenderState (
+                inputPointers[static_cast<size_t> (channel)], samples,
+                outputControlValid ? outputControl.stableF0Hz : schedulerF0,
+                outputControlValid ? outputControl.pitchRatio : schedulerRatio,
+                outputControlValid, false, outputTargetHz,
+                outputControlValid ? outputControl.targetEventId : 0);
+            if (stagedSourceSamples != 0)
+            {
+                const auto* schedulerSource = stagedSource != nullptr
+                                            ? stagedSource[static_cast<size_t> (channel)]
+                                            : inputPointers[static_cast<size_t> (channel)];
+                const auto schedulerSamples = stagedSource != nullptr ? stagedSourceSamples : samples;
+                renderer.ingestAndSchedule (
+                    schedulerSource, schedulerSamples,
+                    schedulerF0, schedulerRatio, sourceControlValid, false, sourceTargetHz,
+                    sourceControlValid ? sourceControl.residualPitchCents : 0.0,
+                    sourceControlValid && sourceControl.continuousReturnExcursionOwnsControl,
+                    sourceControl.continuousReturnExcursionPhase,
+                    sourceControlValid ? sourceControl.targetMidi : -1,
+                    sourceControlValid ? sourceControl.timestampSamples : 0,
+                    sourceControlValid ? sourceControl.targetEventId : 0,
+                    sourceControlValid ? sourceControl.debugPublicationSample : 0);
+            }
+            renderer.readOutput (outputPointers[static_cast<size_t> (channel)], samples, outputState);
+        }
     }
 
     for (int sample = 0; sample < samples; ++sample)
@@ -500,18 +689,120 @@ void VibeAutotuneProcessor::pushPsolaControlFrame (uint64_t timestampSamples, do
                                                     double targetPitchCents, uint64_t targetEventId,
                                                     uint64_t targetEventTimestampSamples,
                                                     int rendererCrossingTargetMidi,
-                                                    double rendererCrossingProgress) noexcept
+                                                    double rendererCrossingProgress,
+                                                    bool continuousReturnExcursionActive,
+                                                    uint8_t continuousReturnExcursionPhase,
+                                                    bool continuousReturnExcursionConsumed,
+                                                    bool continuousReturnExcursionOwnsControl,
+                                                    const CorrectionTrajectoryData* materialization) noexcept
 {
     auto& frame = psolaControlFrames[static_cast<size_t> (psolaControlWriteIndex)];
     frame = { timestampSamples, stableF0Hz, pitchRatio, residualPitchCents,
               valid, holdDry, targetBridge, transientBridge,
               targetMidi, targetPitchCents, targetEventId, targetEventTimestampSamples,
-              rendererCrossingTargetMidi, rendererCrossingProgress };
+              rendererCrossingTargetMidi, rendererCrossingProgress,
+              continuousReturnExcursionActive, continuousReturnExcursionPhase,
+              continuousReturnExcursionConsumed, continuousReturnExcursionOwnsControl };
+    frame.debugWritten = true;
+    frame.debugInsertionSequence = psolaControlInsertionSequence++;
+    frame.debugPublicationSample = debugControlPublicationInputSample;
+    for (auto& renderer : tdpsolaRenderers)
+        renderer.publishControlFrame ({ frame.timestampSamples, frame.debugPublicationSample,
+                                        frame.targetEventId, frame.pitchRatio, frame.targetMidi });
+    if (materialization != nullptr)
+    {
+        frame.debugControlAdvanceSamples = materialization->controlAdvanceSamples;
+        frame.debugControlCorrectionBefore = materialization->controlCorrectionBefore;
+        frame.debugControlCorrectionAfter = materialization->controlCorrectionAfter;
+
+        recordControlMaterializationEvent (timestampSamples, targetEventId,
+                                           targetEventTimestampSamples, pitchRatio,
+                                           *materialization, true);
+    }
     psolaControlWriteIndex = (psolaControlWriteIndex + 1) % static_cast<int> (psolaControlFrames.size());
 }
 
+void VibeAutotuneProcessor::recordControlMaterializationEvent (
+    uint64_t timestampSamples, uint64_t targetEventId, uint64_t targetEventTimestampSamples,
+    double pitchRatio, const CorrectionTrajectoryData& materialization,
+    bool publishedToPsolaRing) noexcept
+{
+    if (! signalChainDiagnosticEnabled.load (std::memory_order_relaxed))
+        return;
+
+    auto& event = controlMaterializationEvents[static_cast<size_t> (
+        controlMaterializationEventCount % static_cast<uint64_t> (controlMaterializationEventCapacity))];
+    event.sequence = controlMaterializationEventCount;
+    event.timestampSamples = timestampSamples;
+    event.targetEventId = targetEventId;
+    event.targetEventTimestampSamples = targetEventTimestampSamples;
+    event.publishedAtInputSample = debugControlPublicationInputSample;
+    event.hostBlockStartSample = debugControlPublicationBlockStartSample;
+    event.hostBlockEndSample = debugControlPublicationBlockEndSample;
+    event.publishedToPsolaRing = publishedToPsolaRing;
+    event.controlAdvanceSamples = materialization.controlAdvanceSamples;
+    event.transitionStartCents = materialization.transitionStartCents;
+    event.transitionTargetCents = materialization.transitionTargetCents;
+    event.transitionProgress = materialization.transitionProgress;
+    event.transitionDurationMs = materialization.transitionDurationMs;
+    event.correctionBeforeAdvance = materialization.controlCorrectionBefore;
+    event.correctionAfterAdvance = materialization.controlCorrectionAfter;
+    event.scheduledRatio = pitchRatio;
+    event.scheduledCorrectionCents = 1200.0 * std::log2 (pitchRatio);
+    ++controlMaterializationEventCount;
+}
+
+void VibeAutotuneProcessor::captureRendererControlLookupTrace (
+    uint64_t queryTimestampSamples, uint8_t lookupRole,
+    const PsolaControlFrame& rawBefore, bool foundBefore,
+    const PsolaControlFrame& rawAfter, bool foundAfter, const PsolaControlFrame& returned,
+    bool interpolationEligible, bool interpolationApplied, double interpolationT) const noexcept
+{
+    // Narrow fixture-specific forensic capture. It never participates in a
+    // control decision and is inactive outside the offline diagnostic.
+    constexpr std::array<uint64_t, 4> tracedQueries { 91008, 236288, 236416, 236544 };
+    if (! signalChainDiagnosticEnabled.load (std::memory_order_relaxed)
+        || std::find (tracedQueries.begin(), tracedQueries.end(), queryTimestampSamples) == tracedQueries.end()
+        || rendererControlLookupTraceCount >= rendererControlLookupTraceCapacity)
+        return;
+
+    const auto describe = [] (const PsolaControlFrame& source, int index) noexcept
+    {
+        RendererControlRingEntry entry;
+        entry.ringIndex = index;
+        entry.written = source.debugWritten;
+        entry.insertionSequence = source.debugInsertionSequence;
+        entry.timestampSamples = source.timestampSamples;
+        entry.pitchRatio = source.pitchRatio;
+        entry.correctionCents = std::isfinite (source.pitchRatio) && source.pitchRatio > 0.0
+                               ? 1200.0 * std::log2 (source.pitchRatio)
+                               : std::numeric_limits<double>::quiet_NaN();
+        entry.targetEventId = source.targetEventId;
+        entry.valid = source.valid;
+        entry.holdDry = source.holdDry;
+        return entry;
+    };
+
+    auto& trace = rendererControlLookupTraces[static_cast<size_t> (rendererControlLookupTraceCount++)];
+    trace = {};
+    trace.queryTimestampSamples = queryTimestampSamples;
+    trace.lookupRole = lookupRole;
+    trace.psolaControlWriteIndex = psolaControlWriteIndex;
+    trace.foundBefore = foundBefore;
+    trace.foundAfter = foundAfter;
+    trace.interpolationEligible = interpolationEligible;
+    trace.interpolationApplied = interpolationApplied;
+    trace.interpolationT = interpolationT;
+    trace.before = describe (rawBefore, -1);
+    trace.after = describe (rawAfter, -1);
+    trace.returned = describe (returned, -1);
+    for (size_t index = 0; index < psolaControlFrames.size(); ++index)
+        trace.ring[index] = describe (psolaControlFrames[index], static_cast<int> (index));
+}
+
 VibeAutotuneProcessor::PsolaControlFrame
-VibeAutotuneProcessor::getRendererControlFrame (uint64_t outputTimelineSample) const noexcept
+VibeAutotuneProcessor::getRendererControlFrame (uint64_t outputTimelineSample,
+                                                 uint8_t lookupRole) const noexcept
 {
     PsolaControlFrame before, after;
     bool foundBefore = false, foundAfter = false;
@@ -535,21 +826,30 @@ VibeAutotuneProcessor::getRendererControlFrame (uint64_t outputTimelineSample) c
     // Both F0 and ratio are continuous control signals. Interpolate only
     // inside a certified voiced run; an invalid frame is a hard unvoiced
     // boundary and is deliberately handed to the renderer's dry crossfade.
-    if (foundBefore && foundAfter && before.valid && after.valid
+    const auto rawBefore = before;
+    const auto rawAfter = after;
+    const auto interpolationEligible = foundBefore && foundAfter && before.valid && after.valid
         && ! before.holdDry && ! after.holdDry
         && std::isfinite (before.stableF0Hz) && std::isfinite (after.stableF0Hz)
-        && before.stableF0Hz > 0.0 && after.stableF0Hz > 0.0)
+        && before.stableF0Hz > 0.0 && after.stableF0Hz > 0.0;
+    auto interpolationApplied = false;
+    auto interpolationT = 0.0;
+    if (interpolationEligible)
     {
         const auto span = after.timestampSamples - before.timestampSamples;
         if (span > 0)
         {
-            const auto t = std::clamp (static_cast<double> (outputTimelineSample - before.timestampSamples)
-                                      / static_cast<double> (span), 0.0, 1.0);
-            before.stableF0Hz += (after.stableF0Hz - before.stableF0Hz) * t;
-            before.pitchRatio += (after.pitchRatio - before.pitchRatio) * t;
-            before.residualPitchCents += (after.residualPitchCents - before.residualPitchCents) * t;
+            interpolationT = std::clamp (static_cast<double> (outputTimelineSample - before.timestampSamples)
+                                         / static_cast<double> (span), 0.0, 1.0);
+            before.stableF0Hz += (after.stableF0Hz - before.stableF0Hz) * interpolationT;
+            before.pitchRatio += (after.pitchRatio - before.pitchRatio) * interpolationT;
+            before.residualPitchCents += (after.residualPitchCents - before.residualPitchCents) * interpolationT;
+            interpolationApplied = true;
         }
     }
+    captureRendererControlLookupTrace (outputTimelineSample, lookupRole,
+                                       rawBefore, foundBefore, rawAfter, foundAfter,
+                                       before, interpolationEligible, interpolationApplied, interpolationT);
     return foundBefore ? before : PsolaControlFrame {};
 }
 
@@ -562,7 +862,8 @@ void VibeAutotuneProcessor::processBlockBypassed (juce::AudioBuffer<float>& buff
         processPitchRenderer (buffer, offset,
                                     juce::jmin (rendererControlIntervalSamples, buffer.getNumSamples() - offset),
                                     false, 1.0, std::numeric_limits<double>::quiet_NaN(),
-                                    false, 1.0, std::numeric_limits<double>::quiet_NaN());
+                                    false, 1.0, std::numeric_limits<double>::quiet_NaN(),
+                                    processedInputSamples + static_cast<uint64_t> (offset));
     processedInputSamples += static_cast<uint64_t> (juce::jmax (0, buffer.getNumSamples()));
     currentAnalysisLatencySamples = pitchAnalysisConfig.frameSize;
     clearPitchMonitor (true);
@@ -617,7 +918,9 @@ void VibeAutotuneProcessor::publishUnvoicedFrame (uint64_t frameEndSample)
 }
 
 void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, bool voiced,
-                                                         uint64_t frameEndSample) noexcept
+                                                         uint64_t frameEndSample,
+                                                         double rawFrequency,
+                                                         double rawConfidence) noexcept
 {
     const auto referencePitch = static_cast<double> (parameters.getRawParameterValue ("referencePitch")->load (std::memory_order_relaxed));
     const auto transpose = static_cast<int> (parameters.getRawParameterValue ("transpose")->load (std::memory_order_relaxed));
@@ -638,15 +941,22 @@ void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, 
     // frameEndSample - 128.  Advance the final 128-sample segment before
     // this YIN frame can commit a new target, so a re-anchor starts from the
     // actual in-flight target rather than from an old note or unity.
-    correctionTrajectory.advanceScheduledTransition (rendererControlIntervalSamples,
-                                                      analysisSampleRate);
+    const auto frameCentreSample = frameEndSample > static_cast<uint64_t> (pitchAnalysisConfig.frameSize / 2)
+                                 ? frameEndSample - static_cast<uint64_t> (pitchAnalysisConfig.frameSize / 2) : 0;
+    const auto finalScheduled = correctionTrajectory.advanceScheduledTransition (rendererControlIntervalSamples,
+                                                                                   analysisSampleRate);
+    if (finalScheduled.hasValidCorrection)
+        recordControlMaterializationEvent (frameCentreSample, psolaTargetEventId,
+                                           psolaTargetEventTimestampSamples, finalScheduled.pitchRatio,
+                                           finalScheduled, false);
     latestCorrectionTrajectory = correctionTrajectory.update (stableFrequency, referencePitch, transpose,
                                                                notePolicy, retuneSpeedMs, flexTunePercent,
                                                                humanizePercent, naturalVibratoPercent,
                                                                analysisSampleRate, pitchAnalysisConfig.hopSize, voiced,
                                                                audioTransientFramesRemaining > 0,
                                                                TuningPolicy::Standard,
-                                                               true);
+                                                               true,
+                                                               rawFrequency, rawConfidence);
     // Ordinary target changes now receive a continuous target trajectory in
     // CorrectionTrajectory. NoteTransition is therefore an exceptional dry
     // safeguard for a large erroneous jump only.
@@ -673,10 +983,12 @@ void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, 
         // diagnostic renderer. TD-PSOLA has a different delivered-pitch
         // gain, so applying that spectral trim to production makes every
         // held correction overshoot by roughly six cents.
-        const auto rendererDeliveryCompensation = usePhaseContinuousRenderer ? rendererDeliveryGain : 1.0;
-        constexpr double maximumDeliveredCorrectionCents = 120.0;
-        const auto compensatedCents = juce::jlimit (-maximumDeliveredCorrectionCents,
-                                                     maximumDeliveredCorrectionCents,
+        const auto rendererDeliveryCompensation = usePhaseContinuousRenderer.load (std::memory_order_relaxed)
+                                              ? rendererDeliveryGain : VIBE_TDPSOLA_DELIVERY_GAIN;
+        const auto deliveryRailCents = rendererDeliveryRailCents (retuneSpeedMs, flexTunePercent,
+                                                                   humanizePercent, naturalVibratoPercent);
+        const auto compensatedCents = juce::jlimit (-deliveryRailCents,
+                                                     deliveryRailCents,
                                                      smoothedCorrectionCents * rendererDeliveryCompensation);
         smoothedPitchRatio = std::exp2 (compensatedCents / 1200.0);
         if (hadValidTrajectoryCorrection)
@@ -694,8 +1006,6 @@ void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, 
     // A YIN estimate belongs to the frame that has just ended, not the host
     // block that happened to trigger analysis.  Using the old block cursor
     // here skewed renderer control by a variable host-block amount.
-    const auto frameCentreSample = frameEndSample > static_cast<uint64_t> (pitchAnalysisConfig.frameSize / 2)
-                                 ? frameEndSample - static_cast<uint64_t> (pitchAnalysisConfig.frameSize / 2) : 0;
     if (latestCorrectionTrajectory.targetChanged)
     {
         ++psolaTargetEventId;
@@ -709,7 +1019,12 @@ void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, 
                            psolaTargetEventId, psolaTargetEventTimestampSamples,
                            latestCorrectionTrajectory.rendererCrossingActive
                                ? latestCorrectionTrajectory.rendererCrossingTargetNote : -1,
-                           latestCorrectionTrajectory.rendererCrossingProgress);
+                           latestCorrectionTrajectory.rendererCrossingProgress,
+                           latestCorrectionTrajectory.continuousReturnExcursionActive,
+                           latestCorrectionTrajectory.continuousReturnExcursionPhase,
+                           latestCorrectionTrajectory.continuousReturnExcursionConsumed,
+                           latestCorrectionTrajectory.continuousReturnExcursionOwnsControl,
+                           &latestCorrectionTrajectory);
 
     // A YIN hop is 512 samples, but renderer control is deliberately
     // delivered every 128 samples.  Schedule the three interior ticks now;
@@ -719,9 +1034,12 @@ void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, 
     {
         const auto scheduled = correctionTrajectory.advanceScheduledTransition (rendererControlIntervalSamples,
                                                                                   analysisSampleRate);
-        const auto rendererDeliveryCompensation = usePhaseContinuousRenderer ? rendererDeliveryGain : 1.0;
+        const auto rendererDeliveryCompensation = usePhaseContinuousRenderer.load (std::memory_order_relaxed)
+                                              ? rendererDeliveryGain : VIBE_TDPSOLA_DELIVERY_GAIN;
+        const auto deliveryRailCents = rendererDeliveryRailCents (retuneSpeedMs, flexTunePercent,
+                                                                   humanizePercent, naturalVibratoPercent);
         const auto scheduledCorrectionCents = scheduled.hasValidCorrection
-                                            ? juce::jlimit (-120.0, 120.0,
+                                            ? juce::jlimit (-deliveryRailCents, deliveryRailCents,
                                                             1200.0 * std::log2 (scheduled.pitchRatio)
                                                                 * rendererDeliveryCompensation)
                                             : 0.0;
@@ -735,7 +1053,12 @@ void VibeAutotuneProcessor::updateCorrectionTrajectory (double stableFrequency, 
                                scheduled.transitionTargetCents,
                                psolaTargetEventId, psolaTargetEventTimestampSamples,
                                scheduled.rendererCrossingActive ? scheduled.rendererCrossingTargetNote : -1,
-                               scheduled.rendererCrossingProgress);
+                               scheduled.rendererCrossingProgress,
+                               scheduled.continuousReturnExcursionActive,
+                               scheduled.continuousReturnExcursionPhase,
+                               scheduled.continuousReturnExcursionConsumed,
+                               scheduled.continuousReturnExcursionOwnsControl,
+                               &scheduled);
     }
 }
 
@@ -880,8 +1203,24 @@ void VibeAutotuneProcessor::analysePitchFrame (uint64_t frameEndSample)
     const auto* frame = pitchAnalysisFrame.data();
     for (int lag = 1; lag <= maximumLag; ++lag)
     {
-        double correlationSum = 0.0;
-        for (int sample = 0; sample < frameSize - lag; ++sample)
+        // This is the detector's dominant live callback kernel.  Independent
+        // accumulators remove the loop-carried floating-point dependency so
+        // the compiler can issue multiple multiply-add chains without using
+        // fast-math or changing the frame, lag range, or publication time.
+        // The final reduction remains double precision; detector equivalence
+        // is covered by the signal-chain/control chronology regression.
+        const auto sampleCount = frameSize - lag;
+        auto sample = 0;
+        double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+        for (; sample + 3 < sampleCount; sample += 4)
+        {
+            sum0 += static_cast<double> (frame[sample])     * static_cast<double> (frame[sample + lag]);
+            sum1 += static_cast<double> (frame[sample + 1]) * static_cast<double> (frame[sample + lag + 1]);
+            sum2 += static_cast<double> (frame[sample + 2]) * static_cast<double> (frame[sample + lag + 2]);
+            sum3 += static_cast<double> (frame[sample + 3]) * static_cast<double> (frame[sample + lag + 3]);
+        }
+        auto correlationSum = (sum0 + sum1) + (sum2 + sum3);
+        for (; sample < sampleCount; ++sample)
             correlationSum += static_cast<double> (frame[sample]) * static_cast<double> (frame[sample + lag]);
 
         yinCrossCorrelation[static_cast<size_t> (lag)] = correlationSum;
@@ -1281,7 +1620,12 @@ void VibeAutotuneProcessor::analysePitchFrame (uint64_t frameEndSample)
     const auto inputDisplay = calculateInputPitchDisplay (stableFrequency, referencePitch, true);
     const auto detectedMidiNote = inputDisplay.midiNote;
     const auto inputCents = static_cast<double> (inputDisplay.cents);
-    updateCorrectionTrajectory (stableFrequency, true, frameEndSample);
+    // This is the exact causal input position reached by YIN when the
+    // control becomes publishable. The host block may contain later samples,
+    // but it does not change this analysis availability point.
+    debugControlPublicationInputSample = frameEndSample;
+    updateCorrectionTrajectory (stableFrequency, true, frameEndSample,
+                                rawCandidate.frequency, rawCandidate.periodicity);
     const auto targetMidiNote = latestCorrectionTrajectory.targetNote;
     const auto outputMidiNote = latestCorrectionTrajectory.hasValidCorrection
                               ? juce::jlimit (0, 127, static_cast<int> (std::lround (69.0 + latestCorrectionTrajectory.correctedPitchCents / 100.0)))
@@ -1305,24 +1649,114 @@ void VibeAutotuneProcessor::analysePitchFrame (uint64_t frameEndSample)
     }
 }
 
+void VibeAutotuneProcessor::setMidiTargetNoteFromUi (int midiNote) noexcept
+{
+    if (midiNote < 0 || midiNote > 127)
+    {
+        midiTargetNote.store (-1, std::memory_order_relaxed);
+        return;
+    }
+
+    midiTargetNote.store (midiNote, std::memory_order_relaxed);
+}
+
+int VibeAutotuneProcessor::getMidiTargetNote() const noexcept
+{
+    return midiTargetNote.load (std::memory_order_relaxed);
+}
+
 void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                           juce::MidiBuffer& midiMessages)
 {
-    juce::ignoreUnused (midiMessages);
+    const auto clearMidiTargets = [this]
+    {
+        midiHeldNotes.fill (false);
+        midiNoteOrder.fill (0);
+        midiTargetNote.store (-1, std::memory_order_relaxed);
+    };
+
+    for (const auto metadata : midiMessages)
+    {
+        const auto message = metadata.getMessage();
+        // Controllers and hosts commonly release notes with CC 120/123.
+        // Treat both as an authoritative flush so a lost NoteOff can never
+        // leave the vocal locked to a stale MIDI target.
+        if (message.isController() && (message.getControllerNumber() == 120
+                                       || message.getControllerNumber() == 123))
+        {
+            clearMidiTargets();
+        }
+        else if (message.isNoteOn())
+        {
+            const auto note = juce::jlimit (0, 127, message.getNoteNumber());
+            midiHeldNotes[static_cast<size_t> (note)] = true;
+            midiNoteOrder[static_cast<size_t> (note)] = ++midiOrderCounter;
+            midiTargetNote.store (note, std::memory_order_relaxed);
+        }
+        else if (message.isNoteOff())
+        {
+            const auto note = juce::jlimit (0, 127, message.getNoteNumber());
+            midiHeldNotes[static_cast<size_t> (note)] = false;
+            auto nextNote = -1;
+            uint64_t newestOrder = 0;
+            for (int candidate = 0; candidate <= 127; ++candidate)
+                if (midiHeldNotes[static_cast<size_t> (candidate)]
+                    && midiNoteOrder[static_cast<size_t> (candidate)] > newestOrder)
+                {
+                    newestOrder = midiNoteOrder[static_cast<size_t> (candidate)];
+                    nextNote = candidate;
+                }
+            midiTargetNote.store (nextNote, std::memory_order_relaxed);
+        }
+    }
 
     {
         const auto numberOfSamples = buffer.getNumSamples();
         const auto blockStartSample = processedInputSamples;
+        debugControlPublicationBlockStartSample = blockStartSample;
+        debugControlPublicationBlockEndSample = blockStartSample + static_cast<uint64_t> (juce::jmax (0, numberOfSamples));
         if (signalChainDiagnosticEnabled.load (std::memory_order_relaxed))
             signalChainDiagnosticFrameCount = 0;
 
         if (parameters.getRawParameterValue ("bypass")->load (std::memory_order_relaxed) >= 0.5f)
         {
-            for (int offset = 0; offset < numberOfSamples; offset += rendererControlIntervalSamples)
-                processPitchRenderer (buffer, offset,
-                                            juce::jmin (rendererControlIntervalSamples, numberOfSamples - offset),
-                                            false, 1.0, std::numeric_limits<double>::quiet_NaN(),
-                                            false, 1.0, std::numeric_limits<double>::quiet_NaN());
+            // Bypass still uses the same source grid so its delayed dry path
+            // cannot splice a partial quantum across callback boundaries.
+            if (numberOfSamples > 0 && numberOfSamples < activeSourceSchedulerQuantumSamples)
+            {
+                if (sourceStageFill == 0)
+                    sourceStageStartSample = blockStartSample;
+                for (int channel = 0; channel < juce::jmin (buffer.getNumChannels(), psolaMaximumChannels); ++channel)
+                    std::copy_n (buffer.getReadPointer (channel), numberOfSamples,
+                                 sourceStage.data() + static_cast<size_t> (channel * sourceStageStorageSamples + sourceStageFill));
+                sourceStageFill += numberOfSamples;
+                const std::array<const float*, 2> stagedPointers {
+                    sourceStage.data(), sourceStage.data() + sourceStageStorageSamples };
+                const auto complete = sourceStageFill == activeSourceSchedulerQuantumSamples;
+                processPitchRenderer (buffer, 0, numberOfSamples,
+                                      false, 1.0, std::numeric_limits<double>::quiet_NaN(),
+                                      false, 1.0, std::numeric_limits<double>::quiet_NaN(),
+                                      std::numeric_limits<double>::quiet_NaN(),
+                                      complete ? sourceStageStartSample : blockStartSample,
+                                      blockStartSample,
+                                      complete ? stagedPointers.data() : nullptr,
+                                      complete ? activeSourceSchedulerQuantumSamples : 0);
+                if (complete)
+                {
+                    sourceStageFill = 0;
+                    sourceStageStartSample += activeSourceSchedulerQuantumSamples;
+                }
+            }
+            else
+            {
+                for (int offset = 0; offset < numberOfSamples; offset += rendererControlIntervalSamples)
+                    processPitchRenderer (buffer, offset,
+                                          juce::jmin (rendererControlIntervalSamples, numberOfSamples - offset),
+                                          false, 1.0, std::numeric_limits<double>::quiet_NaN(),
+                                          false, 1.0, std::numeric_limits<double>::quiet_NaN(),
+                                          std::numeric_limits<double>::quiet_NaN(),
+                                          blockStartSample + static_cast<uint64_t> (offset));
+            }
             processedInputSamples = blockStartSample + static_cast<uint64_t> (juce::jmax (0, numberOfSamples));
             currentAnalysisLatencySamples = pitchAnalysisConfig.frameSize;
             clearPitchMonitor (true);
@@ -1346,22 +1780,27 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         latestBypassed.store (false, std::memory_order_relaxed);
         if (buffer.getNumChannels() > 0)
             captureWaveformScope (buffer.getReadPointer (0), numberOfSamples, blockStartSample);
-        if (buffer.getNumChannels() > 0 && yinDifference.size() >= static_cast<size_t> (pitchAnalysisConfig.frameSize / 2))
-            pushPitchAnalysisSamples (buffer.getReadPointer (0), numberOfSamples, blockStartSample);
-        else
-            publishUnvoicedFrame (blockStartSample + static_cast<uint64_t> (juce::jmax (0, numberOfSamples)));
-
         // Renderer control is evaluated on a fixed internal interval, not at
         // the DAW block boundary. This preserves the calibrated 0–400 ms
         // semantics for every supported host block size.
         const auto currentRetuneMs = parameters.getRawParameterValue ("retuneSpeed")->load (std::memory_order_relaxed);
+        const auto diagnosticRetune10T90Ms = parameters.getRawParameterValue ("diagnosticRetune10T90Ms")->load (std::memory_order_relaxed);
+        const auto diagnosticRetune25T90Ms = parameters.getRawParameterValue ("diagnosticRetune25T90Ms")->load (std::memory_order_relaxed);
+        correctionTrajectory.setDiagnosticRetuneT90Overrides (diagnosticRetune10T90Ms,
+                                                               diagnosticRetune25T90Ms);
+        correctionTrajectory.setDiagnosticJointControlScales (
+            parameters.getRawParameterValue ("diagnosticFlexResidualScale")->load (std::memory_order_relaxed),
+            parameters.getRawParameterValue ("diagnosticHumanizeScale")->load (std::memory_order_relaxed),
+            parameters.getRawParameterValue ("diagnosticNegativeNaturalPhaseScale")->load (std::memory_order_relaxed));
+        correctionTrajectory.setDiagnosticNaturalSurfaceAtHardTuneWeight (
+            parameters.getRawParameterValue ("diagnosticNaturalSurfaceHardTuneWeight")->load (std::memory_order_relaxed));
         const auto voicedColourPercent = parameters.getRawParameterValue ("voicedColour")->load (std::memory_order_relaxed);
         for (auto& renderer : tdpsolaRenderers)
             renderer.setVoicedColourAmountPercent (voicedColourPercent);
         // Only the explicit 0 ms setting is hard tune.  Small non-zero
         // values remain a continuous glide, matching the control's label.
         const auto hardTune = currentRetuneMs == 0.0f;
-        const auto effectiveRetuneMs = CorrectionTrajectory::getEffectiveRetuneTimeMs (currentRetuneMs);
+        const auto effectiveRetuneMs = correctionTrajectory.getEffectiveRetuneTimeMs (currentRetuneMs);
         // The renderer receives a delayed control stream, so its dezipper
         // follows the calibrated response rather than the raw knob label.
         const auto retuneNormalised = effectiveRetuneMs / (effectiveRetuneMs + 100.0);
@@ -1370,14 +1809,55 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                    + (rendererControlDezipperSlowSeconds - rendererControlDezipperFastSeconds)
                                          * retuneNormalised;
 
-        for (int offset = 0; offset < numberOfSamples; offset += rendererControlIntervalSamples)
+        // Source/control chronology is owned exclusively by completed 64
+        // sample source quanta.  In particular, a trailing portion of a
+        // large, non-aligned host callback is staged just like a short host
+        // callback; it must never escape through a direct scheduler path.
+        auto offset = 0;
+        while (offset < numberOfSamples)
         {
-        const auto intervalSamples = juce::jmin (rendererControlIntervalSamples, numberOfSamples - offset);
+        const auto copyCount = juce::jmin (activeSourceSchedulerQuantumSamples - sourceStageFill,
+                                           numberOfSamples - offset);
+        if (sourceStageFill == 0)
+            sourceStageStartSample = blockStartSample + static_cast<uint64_t> (offset);
+        for (int channel = 0; channel < juce::jmin (buffer.getNumChannels(), psolaMaximumChannels); ++channel)
+            std::copy_n (buffer.getReadPointer (channel, offset), copyCount,
+                         sourceStage.data() + static_cast<size_t> (channel * sourceStageStorageSamples + sourceStageFill));
+        sourceStageFill += copyCount;
+        sourceSamplesReceived += static_cast<uint64_t> (copyCount);
+
+        const auto stagedQuantumReady = sourceStageFill == activeSourceSchedulerQuantumSamples;
         const auto outputTime = blockStartSample + static_cast<uint64_t> (offset);
-        const auto delayedControlTime = outputTime > static_cast<uint64_t> (rendererControlDelaySamples)
-                                      ? outputTime - static_cast<uint64_t> (rendererControlDelaySamples)
+        if (! stagedQuantumReady)
+        {
+            // Reading output is independent from source ingestion.  The
+            // fixed renderer latency makes this safe while the partial source
+            // stage waits for its remaining samples; no source/control state
+            // is advanced on this path.
+            processPitchRenderer (buffer, offset, copyCount,
+                                  rendererCorrectionEngaged, renderedPitchRatio,
+                                  lastValidRendererF0Hz, false, 1.0,
+                                  std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::quiet_NaN(),
+                                  sourceStageStartSample, outputTime, nullptr, 0);
+            offset += copyCount;
+            continue;
+        }
+
+        const auto intervalSamples = activeSourceSchedulerQuantumSamples;
+        const auto sourceTime = sourceStageStartSample;
+        const auto outputSamples = copyCount;
+        // Advance analysis and control publication only through this source
+        // segment before TD-PSOLA consumes it. This makes the visible control
+        // set a function of absolute source time, not host callback size.
+        if (buffer.getNumChannels() > 0 && yinDifference.size() >= static_cast<size_t> (pitchAnalysisConfig.frameSize / 2))
+            pushPitchAnalysisSamples (sourceStage.data(), intervalSamples, sourceTime);
+        else
+            publishUnvoicedFrame (sourceTime + static_cast<uint64_t> (intervalSamples));
+        const auto delayedControlTime = sourceTime > static_cast<uint64_t> (rendererControlDelaySamples)
+                                      ? sourceTime - static_cast<uint64_t> (rendererControlDelaySamples)
                                       : 0;
-        const auto rendererControl = getRendererControlFrame (delayedControlTime);
+        const auto rendererControl = getRendererControlFrame (delayedControlTime, 1);
         const auto rendererControlHasPitch = rendererControl.valid
                                           && std::isfinite (rendererControl.stableF0Hz) && rendererControl.stableF0Hz > 0.0
                                           && std::isfinite (rendererControl.pitchRatio);
@@ -1459,7 +1939,7 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                            ? rendererEngageControlFrames + 1 : 0;
             // Two ticks (5.3 ms at 48 kHz) are sufficient to reject a
             // one-frame false F0 while retaining a smooth 0 ms hard-tune.
-            const auto requiredEngageFrames = hardTune ? 2 : 3;
+            const auto requiredEngageFrames = hardTune ? VIBE_HARD_TUNE_ENGAGE_CONTROL_FRAMES : 3;
             rendererCorrectionEngaged = rendererEngageControlFrames >= requiredEngageFrames;
             rendererReleaseControlFrames = 0;
             if (rendererCorrectionEngaged)
@@ -1547,7 +2027,9 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         // Feed the TD-PSOLA scheduler with source-time control. Its output
         // arrives one renderer latency later and is then mixed by the delayed
         // rendererWetIsActive stream above.
-        const auto inputRendererControl = getRendererControlFrame (outputTime);
+        const auto inputRendererControl = getRendererControlFrame (sourceTime, 3);
+        debugCallerControlLookupTime = sourceTime;
+        debugCallerControl = inputRendererControl;
         const auto inputPsolaVoiced = inputRendererControl.valid
                                    && std::isfinite (inputRendererControl.stableF0Hz)
                                    && inputRendererControl.stableF0Hz > 0.0
@@ -1580,14 +2062,17 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                                         inputRendererControl.rendererCrossingProgress);
             committedTargetHz += (previewTargetHz - committedTargetHz) * previewProgress;
         }
-        processPitchRenderer (buffer, offset, intervalSamples, rendererWetIsActive,
+        const std::array<const float*, 2> stagedPointers {
+            sourceStage.data(), sourceStage.data() + sourceStageStorageSamples };
+        processPitchRenderer (buffer, offset, outputSamples, rendererWetIsActive,
                                     rendererWetIsActive ? renderedPitchRatio : 1.0,
                                     rendererWetIsActive ? rendererControlF0 : std::numeric_limits<double>::quiet_NaN(),
                                     inputPsolaVoiced,
                                     inputPsolaVoiced ? inputRendererControl.pitchRatio : 1.0,
                                     inputPsolaVoiced ? inputRendererControl.stableF0Hz
                                                      : std::numeric_limits<double>::quiet_NaN(),
-                                    committedTargetHz);
+                                    committedTargetHz, sourceTime, outputTime,
+                                    stagedPointers.data(), activeSourceSchedulerQuantumSamples);
         tdpsolaReentryDrySamples = juce::jmax (0, tdpsolaReentryDrySamples - intervalSamples);
         const auto writeDiagnosticFrame = [this, outputTime, requestedRendererRatio,
                                            deliveredCorrectionCents, rendererStepCents,
@@ -1613,6 +2098,9 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             frame.rendererStepCents = rendererStepCents;
             frame.dryWetMix = static_cast<float> (rendererDiagnostic.wetMix);
             frame.retuneSpeedMs = parameters.getRawParameterValue ("retuneSpeed")->load (std::memory_order_relaxed);
+            frame.flexTunePercent = parameters.getRawParameterValue ("flexTune")->load (std::memory_order_relaxed);
+            frame.humanizePercent = parameters.getRawParameterValue ("humanize")->load (std::memory_order_relaxed);
+            frame.naturalVibratoPercent = parameters.getRawParameterValue ("naturalVibrato")->load (std::memory_order_relaxed);
             frame.trackingValue = parameters.getRawParameterValue ("tracking")->load (std::memory_order_relaxed);
             frame.flexCorrectionGain = static_cast<float> (latestCorrectionTrajectory.flexCorrectionGain);
             frame.desiredCorrectionCents = static_cast<float> (latestCorrectionTrajectory.desiredCorrectionCents);
@@ -1622,6 +2110,13 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             frame.rawVibratoResidualCents = static_cast<float> (latestCorrectionTrajectory.rawVibratoResidualCents);
             frame.vibratoEnergyCents = static_cast<float> (latestCorrectionTrajectory.vibratoEnergyCents);
             frame.vibratoDeviationCents = static_cast<float> (latestCorrectionTrajectory.vibratoDeviationCents);
+            frame.pitchNoteCenterCents = static_cast<float> (latestCorrectionTrajectory.noteCenterCents);
+            frame.pitchDriftCents = static_cast<float> (latestCorrectionTrajectory.driftCents);
+            frame.pitchVibratoRateHz = static_cast<float> (latestCorrectionTrajectory.vibratoRateHz);
+            frame.pitchVibratoConfidence = static_cast<float> (latestCorrectionTrajectory.vibratoConfidence);
+            frame.pitchNoteStability = static_cast<float> (latestCorrectionTrajectory.noteStability);
+            frame.pitchDriftConfidence = static_cast<float> (latestCorrectionTrajectory.driftConfidence);
+            frame.pitchJitterConfidence = static_cast<float> (latestCorrectionTrajectory.jitterConfidence);
             frame.referenceHz = parameters.getRawParameterValue ("referencePitch")->load (std::memory_order_relaxed);
             frame.voiceRangeMinHz = static_cast<int> (pitchAnalysisConfig.minimumFrequency);
             frame.voiceRangeMaxHz = static_cast<int> (pitchAnalysisConfig.maximumFrequency);
@@ -1643,6 +2138,12 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             frame.trajectoryTransitionDurationMs = static_cast<float> (latestCorrectionTrajectory.transitionDurationMs);
             frame.trajectoryRapidAdjacentContour = latestCorrectionTrajectory.transitionUsesRapidAdjacentContour;
             frame.trajectoryRendererCrossingActive = latestCorrectionTrajectory.rendererCrossingActive;
+            frame.trajectoryRendererCrossingTargetMidi = latestCorrectionTrajectory.rendererCrossingTargetNote;
+            frame.trajectoryRendererCrossingProgress = static_cast<float> (latestCorrectionTrajectory.rendererCrossingProgress);
+            frame.trajectoryExcursionActive = latestCorrectionTrajectory.continuousReturnExcursionActive;
+            frame.trajectoryExcursionPhase = latestCorrectionTrajectory.continuousReturnExcursionPhase;
+            frame.trajectoryExcursionConsumed = latestCorrectionTrajectory.continuousReturnExcursionConsumed;
+            frame.trajectoryExcursionOwnsControl = latestCorrectionTrajectory.continuousReturnExcursionOwnsControl;
             frame.targetDecisionMidpointCents = latestCorrectionTrajectory.targetDecisionMidpointCents;
             frame.targetDecisionExcessCents = static_cast<float> (latestCorrectionTrajectory.targetDecisionExcessCents);
             frame.targetHysteresisCents = static_cast<float> (latestCorrectionTrajectory.targetHysteresisCents);
@@ -1650,6 +2151,10 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             frame.pendingTargetFrames = latestCorrectionTrajectory.pendingTargetFrames;
             frame.targetDecisionBeyondHysteresis = latestCorrectionTrajectory.targetDecisionBeyondHysteresis;
             frame.rapidAdjacentRawCandidate = latestCorrectionTrajectory.rapidAdjacentRawCandidate;
+            frame.rapidAdjacentPrearmed = latestCorrectionTrajectory.rapidAdjacentPrearmed;
+            frame.rapidAdjacentCandidateMidi = latestCorrectionTrajectory.rapidAdjacentCandidateNote;
+            frame.rapidAdjacentEvidenceFrames = latestCorrectionTrajectory.rapidAdjacentEvidenceFrames;
+            frame.rapidAdjacentRawDistanceCents = latestCorrectionTrajectory.rapidAdjacentRawDistanceCents;
             frame.rapidLegatoAdjacentStep = latestCorrectionTrajectory.rapidLegatoAdjacentStep;
             frame.rapidLegatoHardLock = latestCorrectionTrajectory.rapidLegatoHardLock;
             frame.rapidLegatoTargetChanged = latestCorrectionTrajectory.rapidLegatoTargetChanged;
@@ -1663,31 +2168,82 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             frame.trajectoryPreviewUpdates = latestCorrectionTrajectory.trajectoryPreviewUpdates;
             frame.trajectoryPreviewTravelCents = latestCorrectionTrajectory.trajectoryPreviewTravelCents;
             frame.instantaneousInputMotionCentsPerSecond = latestCorrectionTrajectory.instantaneousInputMotionCentsPerSecond;
+            frame.selectorCurrentTargetBefore = latestCorrectionTrajectory.selectorCurrentTargetBefore;
+            frame.selectorPreviousTarget = latestCorrectionTrajectory.selectorPreviousTarget;
+            frame.selectorCandidate = latestCorrectionTrajectory.selectorCandidate;
+            frame.selectorFramesSinceCommit = latestCorrectionTrajectory.selectorFramesSinceCommit;
+            frame.selectorDecision = latestCorrectionTrajectory.selectorDecision;
+            frame.trajectoryPortamentoActive = latestCorrectionTrajectory.portamentoActive;
+            frame.trajectoryUsesPortamentoTarget = latestCorrectionTrajectory.usesPortamentoTarget;
             frame.rapidLegatoDistanceCents = latestCorrectionTrajectory.rapidLegatoDistanceCents;
             frame.rapidLegatoInputMotionCentsPerSecond = latestCorrectionTrajectory.rapidLegatoInputMotionCentsPerSecond;
             frame.latticeReset = rendererDiagnostic.latticeReset;
             frame.dryGuardActive = rendererDiagnostic.dryGuardActive;
             frame.reentryHoldActive = rendererDiagnostic.reentryHoldActive;
             frame.sourceControlTimestamp = inputRendererControl.timestampSamples;
+            frame.outputRendererControlTimestamp = rendererControl.timestampSamples;
+            frame.outputRendererControlPitchRatio = rendererControl.pitchRatio;
+            frame.outputRendererControlTargetMidi = rendererControl.targetMidi;
             frame.sourceControlF0Hz = inputRendererControl.stableF0Hz;
             frame.sourceControlTargetCents = inputRendererControl.targetPitchCents;
             frame.sourceControlTargetMidi = inputRendererControl.targetMidi;
             frame.sourceControlValid = inputRendererControl.valid;
             frame.sourceControlHoldDry = inputRendererControl.holdDry;
             frame.sourceControlPitchRatio = inputRendererControl.pitchRatio;
+            frame.sourceControlMaterializationAdvanceSamples = inputRendererControl.debugControlAdvanceSamples;
+            frame.sourceControlCorrectionBefore = inputRendererControl.debugControlCorrectionBefore;
+            frame.sourceControlCorrectionAfter = inputRendererControl.debugControlCorrectionAfter;
+            frame.sourceControlTrajectoryExcursionActive = inputRendererControl.continuousReturnExcursionActive;
+            frame.sourceControlTrajectoryExcursionPhase = inputRendererControl.continuousReturnExcursionPhase;
+            frame.sourceControlTrajectoryExcursionOwnsControl = inputRendererControl.continuousReturnExcursionOwnsControl;
+            frame.callerControlLookupTime = debugCallerControlLookupTime;
+            frame.rendererControlLookupTime = debugRendererControlLookupTime;
+            frame.controlLookupDeltaSamples = static_cast<int64_t> (debugRendererControlLookupTime)
+                                            - static_cast<int64_t> (debugCallerControlLookupTime);
+            frame.callerControlTimestamp = debugCallerControl.timestampSamples;
+            frame.rendererControlTimestamp = debugRendererControl.timestampSamples;
+            frame.callerControlEventId = debugCallerControl.targetEventId;
+            frame.rendererControlEventId = debugRendererControl.targetEventId;
+            frame.callerControlPitchRatio = debugCallerControl.pitchRatio;
+            frame.rendererControlPitchRatio = debugRendererControl.pitchRatio;
+            frame.rendererStrongRatioStep = rendererDiagnostic.strongRatioStep;
+            frame.rendererRapidCorrectionReversal = rendererDiagnostic.rapidCorrectionReversal;
+            frame.rendererTargetCommitted = rendererDiagnostic.targetCommitted;
+            frame.sourceCursorBeforeStrongStep = rendererDiagnostic.sourceCursorBeforeStrongStep;
+            frame.sourceCursorAfterStrongStep = rendererDiagnostic.sourceCursorAfterStrongStep;
+            frame.sourceCursorReanchorSuppressed = rendererDiagnostic.sourceCursorReanchorSuppressed;
+            frame.fractionalPhaseOffsetAtSpawn = rendererDiagnostic.fractionalPhaseOffsetAtSpawn;
+            frame.overlapPhaseOffsetAtSpawn = rendererDiagnostic.overlapPhaseOffsetAtSpawn;
             frame.olaOverlapWeight = static_cast<float> (rendererDiagnostic.currentOverlapWeight);
             frame.olaAudibleRatioAtStart = rendererDiagnostic.audibleRatioAtStart;
             frame.olaAudibleGrainAge = rendererDiagnostic.audibleGrainAge;
+            frame.olaNewestTargetGrainWeight = rendererDiagnostic.newestTargetGrainWeight;
+            frame.olaPreviousTargetGrainWeight = rendererDiagnostic.previousTargetGrainWeight;
+            frame.olaNewestTargetFirstAudibleSample = rendererDiagnostic.newestTargetFirstAudibleSample;
+            frame.olaPreviousTargetLastAudibleSample = rendererDiagnostic.previousTargetLastAudibleSample;
             frame.olaAudibleReadPosition = rendererDiagnostic.audibleReadPosition;
             frame.olaDominantGrainWeight = rendererDiagnostic.dominantGrainWeight;
             frame.olaDominantGrainEpoch = rendererDiagnostic.dominantGrainEpoch;
             frame.olaDominantGrainRatio = rendererDiagnostic.dominantGrainRatio;
             frame.olaDominantGrainExpectedF0 = rendererDiagnostic.dominantGrainExpectedF0;
+            frame.olaDominantGrainTargetMidi = rendererDiagnostic.dominantGrainTargetMidi;
+            frame.olaDominantGrainTargetEventId = rendererDiagnostic.dominantGrainTargetEventId;
+            frame.olaDominantGrainControlEventId = rendererDiagnostic.dominantGrainControlEventId;
+            frame.olaDominantGrainTargetControlTimestamp = rendererDiagnostic.dominantGrainTargetControlTimestamp;
+            frame.olaDominantGrainTrajectoryExcursionId = rendererDiagnostic.dominantGrainTrajectoryExcursionId;
             frame.olaTargetCandidateWeight = rendererDiagnostic.targetCandidateWeight;
             frame.olaTargetCandidateEpoch = rendererDiagnostic.targetCandidateEpoch;
             frame.olaTargetCandidateExpectedF0 = rendererDiagnostic.targetCandidateExpectedF0;
             frame.actualSpawnEpoch = rendererDiagnostic.actualSpawnEpoch;
+            frame.grainDecisionInputSample = rendererDiagnostic.grainDecisionInputSample;
+            frame.grainFirstAudibleSample = rendererDiagnostic.grainFirstAudibleSample;
+            frame.grainHalfWindowAtSpawn = rendererDiagnostic.grainHalfWindowAtSpawn;
+            frame.grainSourceMarkAtSpawn = rendererDiagnostic.grainSourceMarkAtSpawn;
             frame.ratioAtSpawn = rendererDiagnostic.ratioAtSpawn;
+            frame.spawnTargetMidi = rendererDiagnostic.targetMidiAtSpawn;
+            frame.spawnTargetEventId = rendererDiagnostic.targetEventIdAtSpawn;
+            frame.spawnTargetControlTimestamp = rendererDiagnostic.targetControlTimestampAtSpawn;
+            frame.spawnTrajectoryExcursionId = rendererDiagnostic.trajectoryExcursionIdAtSpawn;
             frame.spawnSourceMarkF0 = rendererDiagnostic.sourcePeriodAtSpawn > 0.0
                                         ? analysisSampleRate / rendererDiagnostic.sourcePeriodAtSpawn : 0.0;
             frame.spawnExpectedF0 = frame.spawnSourceMarkF0 * frame.ratioAtSpawn;
@@ -1726,6 +2282,18 @@ void VibeAutotuneProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             writeDiagnosticFrame (liveFrame);
             captureLiveDiagnosticFrame (liveFrame);
         }
+        {
+            if (sourceStageStartSample < nextScheduledSourceSample)
+                ++schedulerOverlapCount;
+            else if (sourceStageStartSample > nextScheduledSourceSample)
+                ++schedulerGapCount;
+            nextScheduledSourceSample = sourceStageStartSample + activeSourceSchedulerQuantumSamples;
+            sourceSamplesScheduled += activeSourceSchedulerQuantumSamples;
+            ++sourceQuantumsScheduled;
+            sourceStageFill = 0;
+            sourceStageStartSample = nextScheduledSourceSample;
+        }
+        offset += copyCount;
         }
         processedInputSamples = blockStartSample + static_cast<uint64_t> (juce::jmax (0, numberOfSamples));
         return;
@@ -1782,7 +2350,116 @@ VibeAutotuneProcessor::PitchTrackingData VibeAutotuneProcessor::getPitchTracking
     data.voiced = latestVoiced.load (std::memory_order_relaxed);
     data.timestampSamples = latestPitchTimestampSamples.load (std::memory_order_relaxed);
     data.analysisLatencySamples = latestAnalysisLatencySamples.load (std::memory_order_relaxed);
+    data.detectedMidiNote = latestDetectedMidiNote.load (std::memory_order_relaxed);
+    data.targetMidiNote = latestTargetMidiNote.load (std::memory_order_relaxed);
+    data.outputMidiNote = latestOutputMidiNote.load (std::memory_order_relaxed);
+    data.inputCents = latestInputCents.load (std::memory_order_relaxed);
+    data.correctionCents = latestCentsDeviation.load (std::memory_order_relaxed);
     return data;
+}
+
+VibeAutotuneProcessor::SourceSchedulerDiagnostics
+VibeAutotuneProcessor::getSourceSchedulerDiagnostics() const noexcept
+{
+    return { sourceSamplesReceived, sourceSamplesScheduled, sourceQuantumsScheduled,
+             sourceStageFill, sourceDropCount, sourceDuplicateCount,
+             schedulerGapCount, schedulerOverlapCount,
+             tdpsolaRenderers[0].getMaximumOutputAheadAtSourcePlanner(),
+             tdpsolaRenderers[0].getMaximumOutputAdvanceBetweenSourcePlanners() };
+}
+
+uint64_t VibeAutotuneProcessor::getRendererOlaDeadlineViolationCount() const noexcept
+{
+    return tdpsolaRenderers[0].getOlaDeadlineViolationCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererPendingDeadlineMissCount() const noexcept
+{
+    return tdpsolaRenderers[0].getPendingDeadlineMissCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererLateCandidateCreationCount() const noexcept
+{
+    return tdpsolaRenderers[0].getLateCandidateCreationCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererLateOlaWriteCount() const noexcept
+{
+    return tdpsolaRenderers[0].getLateOlaWriteCount();
+}
+
+int VibeAutotuneProcessor::getRendererPendingQueuePeakOccupancy() const noexcept
+{
+    return tdpsolaRenderers[0].getPendingQueuePeakOccupancy();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererPendingQueueOverflowCount() const noexcept
+{
+    return tdpsolaRenderers[0].getPendingQueueOverflowCount();
+}
+
+int VibeAutotuneProcessor::getRendererRetimableEpochPeakOccupancy() const noexcept
+{
+    return tdpsolaRenderers[0].getRetimableEpochPeakOccupancy();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererEpochRetimeCount() const noexcept
+{
+    return tdpsolaRenderers[0].getEpochRetimeCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererRetimedSamplesTotal() const noexcept
+{
+    return tdpsolaRenderers[0].getRetimedSamplesTotal();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererMaxSingleEpochRetime() const noexcept
+{
+    return tdpsolaRenderers[0].getMaxSingleEpochRetime();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererRetimeDeadlineMissCount() const noexcept
+{
+    return tdpsolaRenderers[0].getRetimeDeadlineMissCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererEpochOrderViolationCount() const noexcept
+{
+    return tdpsolaRenderers[0].getEpochOrderViolationCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererTicketIssuedPastDeadlineCount() const noexcept
+{
+    return tdpsolaRenderers[0].getTicketIssuedPastDeadlineCount();
+}
+
+uint64_t VibeAutotuneProcessor::getRendererTicketMutationAfterIssueCount() const noexcept
+{
+    return tdpsolaRenderers[0].getTicketMutationAfterIssueCount();
+}
+
+void VibeAutotuneProcessor::setRendererEpochTraceEnabled (bool shouldEnable) noexcept
+{
+    for (auto& renderer : tdpsolaRenderers)
+        renderer.setEpochTraceEnabled (shouldEnable);
+}
+
+int VibeAutotuneProcessor::copyRendererEpochTraces (CausalTDPSOLARenderer::EpochTrace* destination,
+                                                     int maximumTraces) const noexcept
+{
+    return tdpsolaRenderers[0].copyEpochTraces (destination, maximumTraces);
+}
+
+void VibeAutotuneProcessor::setRendererOlaContributionTraceRange (uint64_t firstSample, uint64_t lastSample)
+{
+    for (auto& renderer : tdpsolaRenderers)
+        renderer.setOlaContributionTraceRange (firstSample, lastSample);
+}
+
+int VibeAutotuneProcessor::copyRendererOlaContributionTraces (
+    CausalTDPSOLARenderer::OlaContributionTrace* destination, int maximumTraces) const noexcept
+{
+    return tdpsolaRenderers[0].copyOlaContributionTraces (destination, maximumTraces);
 }
 
 VibeAutotuneProcessor::CorrectionDeliveryData VibeAutotuneProcessor::getCorrectionDeliveryData() const noexcept
@@ -1804,6 +2481,15 @@ void VibeAutotuneProcessor::setSignalChainDiagnosticEnabled (bool shouldEnable) 
 {
     signalChainDiagnosticEnabled.store (shouldEnable, std::memory_order_relaxed);
     signalChainDiagnosticFrameCount = 0;
+    rendererControlLookupTraceCount = 0;
+    const auto track = shouldEnable || liveDiagnosticCaptureEnabled.load (std::memory_order_relaxed);
+    for (auto& renderer : tdpsolaRenderers)
+        renderer.setDiagnosticTrackingEnabled (track);
+}
+
+void VibeAutotuneProcessor::setRapidAdjacentTargetSelectionEnabled (bool shouldEnable) noexcept
+{
+    correctionTrajectory.setRapidAdjacentTargetSelectionEnabled (shouldEnable);
 }
 
 void VibeAutotuneProcessor::setRendererDiagnosticAblation (CausalTDPSOLARenderer::DiagnosticAblation value) noexcept
@@ -1813,14 +2499,22 @@ void VibeAutotuneProcessor::setRendererDiagnosticAblation (CausalTDPSOLARenderer
     // future diagnostic switch, never by target-aware grain ownership.
     correctionTrajectory.setDiagnosticRaisedCosineHardTuneLegato (false);
     correctionTrajectory.setDiagnosticRapidLegatoPreview (false);
+    correctionTrajectory.setDiagnosticRapidLegatoReturnPreview (value.rapidLegatoReturnPreview);
+    correctionTrajectory.setDiagnosticContinuousRapidReturnExcursion (value.continuousRapidReturnExcursion);
+    correctionTrajectory.setDiagnosticContinuousReturnExcursionTuning (
+        value.continuousReturnMinimumCoherentFrames,
+        value.continuousReturnMinimumTravelCents,
+        value.continuousReturnHoldMilliseconds);
     // Candidate rendering is strictly a renderer-side forensic experiment.
     // It must not change target timing or the correction trajectory: doing so
     // makes a listening comparison cease to be A/B against the shipped
     // production path. Keep every trajectory-only experiment disabled here.
     correctionTrajectory.setDiagnosticStrongHardTunePull (false);
-    usePhaseContinuousRenderer = value.phaseContinuousRenderer;
-    phaseForceUnityRatioForDiagnostic = value.phaseForceUnityRatio;
-    phaseForceStaticUpRatioForDiagnostic = value.phaseForceStaticUpRatio;
+    correctionTrajectory.setDiagnosticSlowRetuneInputReferenceAmountOverride (
+        value.slowRetuneInputReferenceAmountOverride);
+    usePhaseContinuousRenderer.store (value.phaseContinuousRenderer, std::memory_order_release);
+    phaseForceUnityRatioForDiagnostic.store (value.phaseForceUnityRatio, std::memory_order_release);
+    phaseForceStaticUpRatioForDiagnostic.store (value.phaseForceStaticUpRatio, std::memory_order_release);
     for (auto& renderer : tdpsolaRenderers)
         renderer.setDiagnosticAblation (value);
 }
@@ -1840,12 +2534,29 @@ void VibeAutotuneProcessor::setNaturalVibratoSurfaceDiagnostic (
     correctionTrajectory.setDiagnosticNaturalVibratoSurface (surface);
 }
 
+void VibeAutotuneProcessor::setNegativeNaturalPhaseScaleDiagnostic (double scale) noexcept
+{
+    correctionTrajectory.setDiagnosticNegativeNaturalPhaseScale (scale);
+}
+
+void VibeAutotuneProcessor::setHardTuneWideTransitionDiagnostic (double upwardDurationMs,
+                                                                 double downwardDurationMs,
+                                                                 int shape) noexcept
+{
+    correctionTrajectory.setDiagnosticHardTuneWideTransition (upwardDurationMs,
+                                                               downwardDurationMs,
+                                                               shape);
+}
+
 void VibeAutotuneProcessor::setLiveDiagnosticCaptureEnabled (bool shouldEnable) noexcept
 {
     if (shouldEnable)
         liveDiagnosticClearRequested.store (true, std::memory_order_release);
 
     liveDiagnosticCaptureEnabled.store (shouldEnable, std::memory_order_release);
+    const auto track = shouldEnable || signalChainDiagnosticEnabled.load (std::memory_order_relaxed);
+    for (auto& renderer : tdpsolaRenderers)
+        renderer.setDiagnosticTrackingEnabled (track);
 }
 
 bool VibeAutotuneProcessor::isLiveDiagnosticCaptureEnabled() const noexcept
@@ -1891,13 +2602,13 @@ void VibeAutotuneProcessor::captureWaveformScope (const float* input, int sample
 
         auto& frame = waveformScopeFrames[static_cast<size_t> (waveformScopeProducerCount
                                            % static_cast<uint64_t> (waveformScopeCapacity))];
-        frame.sampleIndex = startSample + static_cast<uint64_t> (offset);
-        frame.minimum = minimum;
-        frame.maximum = maximum;
-        frame.inputPitchCents = static_cast<float> (latestCorrectionTrajectory.inputPitchCents);
-        frame.targetPitchCents = static_cast<float> (latestCorrectionTrajectory.targetPitchCents);
-        frame.deliveredCorrectionCents = latestCentsDeviation.load (std::memory_order_relaxed);
-        frame.voiced = latestVoiced.load (std::memory_order_relaxed);
+        frame.sampleIndex.store (startSample + static_cast<uint64_t> (offset), std::memory_order_relaxed);
+        frame.minimum.store (minimum, std::memory_order_relaxed);
+        frame.maximum.store (maximum, std::memory_order_relaxed);
+        frame.inputPitchCents.store (static_cast<float> (latestCorrectionTrajectory.inputPitchCents), std::memory_order_relaxed);
+        frame.targetPitchCents.store (static_cast<float> (latestCorrectionTrajectory.targetPitchCents), std::memory_order_relaxed);
+        frame.deliveredCorrectionCents.store (latestCentsDeviation.load (std::memory_order_relaxed), std::memory_order_relaxed);
+        frame.voiced.store (latestVoiced.load (std::memory_order_relaxed), std::memory_order_relaxed);
         ++waveformScopeProducerCount;
         waveformScopePublishedCount.store (waveformScopeProducerCount, std::memory_order_release);
     }
@@ -1913,8 +2624,18 @@ int VibeAutotuneProcessor::copyWaveformScopeFrames (WaveformScopeFrame* destinat
                                    static_cast<uint64_t> (maximumFrames));
     const auto first = published - count;
     for (uint64_t index = 0; index < count; ++index)
-        destination[static_cast<size_t> (index)] = waveformScopeFrames[static_cast<size_t> ((first + index)
-                                                    % static_cast<uint64_t> (waveformScopeCapacity))];
+    {
+        const auto& source = waveformScopeFrames[static_cast<size_t> ((first + index)
+                                                 % static_cast<uint64_t> (waveformScopeCapacity))];
+        auto& frame = destination[static_cast<size_t> (index)];
+        frame.sampleIndex = source.sampleIndex.load (std::memory_order_relaxed);
+        frame.minimum = source.minimum.load (std::memory_order_relaxed);
+        frame.maximum = source.maximum.load (std::memory_order_relaxed);
+        frame.inputPitchCents = source.inputPitchCents.load (std::memory_order_relaxed);
+        frame.targetPitchCents = source.targetPitchCents.load (std::memory_order_relaxed);
+        frame.deliveredCorrectionCents = source.deliveredCorrectionCents.load (std::memory_order_relaxed);
+        frame.voiced = source.voiced.load (std::memory_order_relaxed);
+    }
     return static_cast<int> (count);
 }
 
@@ -1944,6 +2665,33 @@ int VibeAutotuneProcessor::copySignalChainDiagnosticFrames (SignalChainDiagnosti
 
     const auto count = juce::jlimit (0, maximumFrames, signalChainDiagnosticFrameCount);
     std::copy_n (signalChainDiagnosticFrames.data(), count, destination);
+    return count;
+}
+
+int VibeAutotuneProcessor::copyControlMaterializationEvents (ControlMaterializationEvent* destination,
+                                                              int maximumEvents) const noexcept
+{
+    if (destination == nullptr || maximumEvents <= 0)
+        return 0;
+
+    const auto available = juce::jmin (controlMaterializationEventCount,
+                                       static_cast<uint64_t> (controlMaterializationEventCapacity));
+    const auto count = juce::jmin (available, static_cast<uint64_t> (maximumEvents));
+    const auto first = controlMaterializationEventCount - count;
+    for (uint64_t index = 0; index < count; ++index)
+        destination[static_cast<size_t> (index)] = controlMaterializationEvents[static_cast<size_t> (
+            (first + index) % static_cast<uint64_t> (controlMaterializationEventCapacity))];
+    return static_cast<int> (count);
+}
+
+int VibeAutotuneProcessor::copyRendererControlLookupTraces (RendererControlLookupTrace* destination,
+                                                             int maximumTraces) const noexcept
+{
+    if (destination == nullptr || maximumTraces <= 0)
+        return 0;
+
+    const auto count = juce::jlimit (0, maximumTraces, rendererControlLookupTraceCount);
+    std::copy_n (rendererControlLookupTraces.data(), count, destination);
     return count;
 }
 
@@ -2088,6 +2836,38 @@ void VibeAutotuneProcessor::setNoteRuleForMidiNote (int midiNote, NoteRule rule)
     midiNoteOverridePolicy[static_cast<size_t> (midiNote)].store (noteRuleValue (rule), std::memory_order_relaxed);
     midiNoteHasOverride[static_cast<size_t> (midiNote)].store (true, std::memory_order_relaxed);
     notePolicyRevision.fetch_add (1, std::memory_order_relaxed);
+}
+
+void VibeAutotuneProcessor::resetNoteRuleForPitchClass (int pitchClass) noexcept
+{
+    const auto safePitchClass = (pitchClass % 12 + 12) % 12;
+    const auto defaultRule = (getBaseScaleMask() & static_cast<uint16_t> (1u << safePitchClass)) != 0
+                           ? NoteRule::Legal : NoteRule::IllegalNearest;
+    setNoteRuleForPitchClass (safePitchClass, defaultRule);
+}
+
+void VibeAutotuneProcessor::resetNoteRuleForMidiNote (int midiNote) noexcept
+{
+    if (midiNote < 0 || midiNote > 127)
+        return;
+
+    if (groupOctaves.load (std::memory_order_relaxed))
+    {
+        resetNoteRuleForPitchClass (midiNote % 12);
+        return;
+    }
+
+    midiNoteHasOverride[static_cast<size_t> (midiNote)].store (false, std::memory_order_relaxed);
+    notePolicyRevision.fetch_add (1, std::memory_order_relaxed);
+}
+
+void VibeAutotuneProcessor::resetNotePolicyToCurrentScale() noexcept
+{
+    const auto key = juce::jlimit (0, 11,
+        static_cast<int> (parameters.getRawParameterValue ("key")->load (std::memory_order_relaxed)));
+    const auto scale = juce::jlimit (0, userScaleIndex,
+        static_cast<int> (parameters.getRawParameterValue ("scale")->load (std::memory_order_relaxed)));
+    resetNotePolicyToScale (key, scale);
 }
 
 bool VibeAutotuneProcessor::getGroupOctaves() const noexcept

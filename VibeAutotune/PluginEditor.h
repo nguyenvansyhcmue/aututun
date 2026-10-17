@@ -1,6 +1,10 @@
 #pragma once
 
 #include "PluginProcessor.h"
+#include <functional>
+#include <utility>
+#include "AnalogRotaryControl.h"
+#include "AnalogHardwareButton.h"
 
 class VibeAutotuneEditor : public juce::AudioProcessorEditor,
                            private juce::Timer
@@ -10,33 +14,39 @@ public:
     ~VibeAutotuneEditor() override;
 
     void paint (juce::Graphics& g) override;
+    void paintOverChildren (juce::Graphics& g) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent& event) override;
+    bool keyPressed (const juce::KeyPress& key) override;
 
 private:
-    // The hardware-style controls use a right-hand zero point.  This only
-    // changes the visual/gesture direction of the JUCE Slider; the attached
-    // APVTS parameter still retains its normal range and automation mapping.
-    class HardwareRotarySlider : public juce::Slider
+    class NoteRuleHitTarget final : public juce::Component
     {
     public:
-        double proportionOfLengthToValue (double proportion) override
+        std::function<void (const juce::ModifierKeys&)> onGesture;
+        void mouseDown (const juce::MouseEvent& event) override
         {
-            return juce::Slider::proportionOfLengthToValue (1.0 - proportion);
+            if (onGesture != nullptr)
+                onGesture (event.mods);
         }
+    };
 
-        double valueToProportionOfLength (double value) override
-        {
-            return 1.0 - juce::Slider::valueToProportionOfLength (value);
-        }
+    struct NoteMapVisualSlot
+    {
+        int midiNote = -1;
+        bool isBlack = false;
+        juce::Rectangle<float> keyBounds;
+        juce::Rectangle<float> indicatorBounds;
     };
 
     // Retune has a musical, non-linear faceplate: the useful fast range gets
     // more angular resolution while the parameter/automation remains exactly
     // 0–400 ms.  Landmarks: 50 ms at 12 o'clock and 125 ms near 10 o'clock.
-    class RetuneRotarySlider final : public HardwareRotarySlider
+    class RetuneRotarySlider final : public AnalogRotaryControl
     {
     public:
+        RetuneRotarySlider() { setVerticalDragInverted (true); }
+
         double proportionOfLengthToValue (double proportion) override
         {
             const auto p = juce::jlimit (0.0, 1.0, proportion);
@@ -69,28 +79,35 @@ private:
     void configureSelector (juce::ComboBox& selector, juce::Label& label,
                             const juce::String& title, const juce::StringArray& choices);
     void drawPanel (juce::Graphics& g, juce::Rectangle<float> area, const juce::String& title) const;
-    void drawKnobBackdrop (juce::Graphics& g, juce::Rectangle<float> area) const;
     void drawPianoKeyboard (juce::Graphics& g) const;
-    void drawWaveformScope (juce::Graphics& g) const;
-    void exportLiveDiagnosticCsv();
+    void drawPitchMonitor (juce::Graphics& g) const;
+    void drawRuleMarker (juce::Graphics& g, juce::Rectangle<float> bounds,
+                         NoteRule rule, float opacity) const;
+    int pianoNoteAt (juce::Point<int> position) const noexcept;
+    bool isNoteInSelectedVoiceRange (int midiNote) const noexcept;
+    void applyNoteRule (int midiNote, NoteRule rule);
+    void showNoteRuleMenu (int midiNote, juce::Rectangle<int> targetBounds);
+    void handleNoteRuleGesture (int midiNote, const juce::ModifierKeys& modifiers);
 
     VibeAutotuneProcessor& processor;
     VibeAutotuneProcessor::PitchMonitorData monitor;
 
-    juce::TextButton bypassButton { "POWER" };
-    juce::TextButton dashboardTabButton { "DASHBOARD" };
-    juce::TextButton waveformTabButton { "WAVEFORM" };
-    juce::TextButton diagnosticCaptureButton { "CAPTURE" };
-    juce::TextButton diagnosticExportButton { "EXPORT CSV" };
-    juce::ToggleButton groupOctavesButton { "GROUP OCTAVES" };
+    AnalogTextButton bypassButton { "POWER" };
+    AnalogTextButton settingsButton { "SETTINGS" };
+    AnalogTextButton editNotesButton { "EDIT NOTES" };
+    AnalogToggleButton groupOctavesButton { "GROUP OCTAVES" };
+    // Primary selectors remain in the utility section.  The Note Map owns
+    // compact mirrored controls so musical context is visible where notes are
+    // edited without relocating the main controls.
     juce::ComboBox inputTypeSelector, keySelector, scaleSelector;
+    juce::ComboBox noteMapVoiceSelector, noteMapKeySelector, noteMapScaleSelector;
     juce::Label inputTypeLabel, keyLabel, scaleLabel;
 
     RetuneRotarySlider retuneSpeedSlider;
-    HardwareRotarySlider pitchFlexibleSlider;
-    HardwareRotarySlider humanizeSlider;
-    HardwareRotarySlider naturalVibratoSlider;
-    HardwareRotarySlider transposeSlider, referencePitchSlider, trackingSlider, voicedColourSlider;
+    AnalogRotaryControl pitchFlexibleSlider;
+    AnalogRotaryControl humanizeSlider;
+    AnalogRotaryControl naturalVibratoSlider;
+    AnalogRotaryControl transposeSlider, referencePitchSlider, trackingSlider, voicedColourSlider;
     juce::Label retuneSpeedLabel, pitchFlexibleLabel;
     juce::Label humanizeLabel;
     juce::Label naturalVibratoLabel;
@@ -98,23 +115,39 @@ private:
 
     std::unique_ptr<ButtonAttachment> bypassAttachment;
     std::unique_ptr<ComboBoxAttachment> inputTypeAttachment, keyAttachment, scaleAttachment;
+    std::unique_ptr<ComboBoxAttachment> noteMapScaleAttachment;
     std::unique_ptr<SliderAttachment> retuneSpeedAttachment, flexTuneAttachment, humanizeAttachment,
                                       naturalVibratoAttachment;
     std::unique_ptr<SliderAttachment> transposeAttachment, referencePitchAttachment, trackingAttachment, voicedColourAttachment;
 
-    juce::Rectangle<int> headerBounds, settingsBounds, waveformBounds, monitorBounds, mainControlsBounds, utilityControlsBounds, pianoBounds;
+    juce::Rectangle<int> headerBounds, correctionBounds, monitorBounds, setupBounds, pianoBounds;
     std::array<juce::Rectangle<int>, 8> knobBounds;
     // C1 through B5 gives the range indicator enough context for every
     // supported input profile without turning the keyboard into a scroll view.
-    std::array<juce::Rectangle<int>, 60> pianoKeyBounds;
-    std::array<juce::Rectangle<int>, 60> noteStatusBounds;
+    // A single geometry record per MIDI note is the source of truth for
+    // drawing, hit-testing and the interactive editor overlay.
+    std::array<NoteMapVisualSlot, 60> noteMapSlots;
+    std::array<NoteRuleHitTarget, 60> noteRuleHitTargets;
     int activePianoNote = -1;
     int targetPianoNote = -1;
+    int uiPressedPianoNote = -1;
+    int uiPressFramesRemaining = 0;
     float displayedAppliedCorrectionCents = 0.0f;
+    float displayedPitchConfidence = 0.0f;
+    // Presentation-only motion state. It is fed from published monitor
+    // snapshots on the message thread and is never read by the audio thread.
+    float ribbonMotionPhase = 0.0f;
+    float displayedRibbonMotion = 0.0f;
     bool monitorHasValidPitch = false;
-    bool waveformTabSelected = false;
-    std::array<VibeAutotuneProcessor::WaveformScopeFrame, VibeAutotuneProcessor::waveformScopeCapacity> waveformScopeFrames {};
-    int waveformScopeFrameCount = 0;
+    bool editNotesEnabled = false;
+    std::array<VibeAutotuneProcessor::WaveformScopeFrame, VibeAutotuneProcessor::waveformScopeCapacity> monitorScopeFrames {};
+    int monitorScopeFrameCount = 0;
+
+   #if JUCE_DEBUG
+    juce::Image targetReferenceImage;
+    bool showTargetOverlay = false;
+    bool useReferenceVisualState = false;
+   #endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VibeAutotuneEditor)
 };

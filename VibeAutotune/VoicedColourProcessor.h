@@ -50,7 +50,8 @@ public:
         // progressively. This makes Colour a timbre control rather than an
         // accidental loudness boost.
         const auto saturatedSample = std::tanh (wetSample * drive) / drive;
-        return wetSample + (saturatedSample - wetSample) * smoothedMix;
+        return static_cast<float> (static_cast<double> (wetSample)
+                                   + (static_cast<double> (saturatedSample) - wetSample) * smoothedMix);
     }
 
 private:

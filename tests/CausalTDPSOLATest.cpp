@@ -16,11 +16,6 @@ double estimateF0 (const std::vector<float>& samples, int begin, int end, double
     return crossings * sampleRate / static_cast<double> (end - begin);
 }
 
-void require (bool condition, const char* message)
-{
-    if (! condition) { std::cerr << "FAILED: " << message << '\n'; std::exit (1); }
-}
-
 double centsError (double actual, double expected) { return 1200.0 * std::log2 (actual / expected); }
 
 double sinusoidMagnitude (const std::vector<float>& samples, int begin, int end,
@@ -180,6 +175,89 @@ void reportHarmonicProfileWithControlJitter()
     }
     std::cout << '\n';
 }
+
+bool verifyTrajectoryExcursionCursorIsolation()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int block = 64;
+    constexpr double sourceF0 = 220.0;
+    CausalTDPSOLARenderer renderer;
+    CausalTDPSOLARenderer::DiagnosticAblation ablation;
+    ablation.preserveSourceCursorDuringTrajectoryExcursion = true;
+    renderer.setDiagnosticAblation (ablation);
+    renderer.prepare (sampleRate, block, 256);
+
+    std::vector<float> input (block), output (block);
+    auto phase = 0.0;
+    for (int start = 0; start < 48000; start += block)
+    {
+        const auto ratio = std::exp2 (40.0 / 1200.0);
+        for (int sample = 0; sample < block; ++sample)
+        {
+            input[static_cast<size_t> (sample)] = static_cast<float> (0.3 * std::sin (phase));
+            phase += 2.0 * std::numbers::pi * sourceF0 / sampleRate;
+        }
+        renderer.process (input.data(), output.data(), block, sourceF0, ratio, true, false, sourceF0);
+    }
+
+    CausalTDPSOLARenderer::DiagnosticState excursionStep;
+    auto sawExcursionCursorDecision = false;
+    for (int step = 0; step < 16; ++step)
+    {
+        const auto ratio = std::exp2 ((step % 2 == 0 ? -50.0 : 40.0) / 1200.0);
+        for (int sample = 0; sample < block; ++sample)
+        {
+            input[static_cast<size_t> (sample)] = static_cast<float> (0.3 * std::sin (phase));
+            phase += 2.0 * std::numbers::pi * sourceF0 / sampleRate;
+        }
+        renderer.process (input.data(), output.data(), block, sourceF0, ratio, true, false,
+                          sourceF0, 0.0, true, 1);
+        const auto& state = renderer.getDiagnosticState();
+        if (state.sourceCursorBeforeStrongStep >= 0.0)
+        {
+            excursionStep = state;
+            sawExcursionCursorDecision = true;
+            break;
+        }
+    }
+
+    // A real target commit remains eligible for the ordinary source-cursor
+    // handoff even if a caller accidentally labels the same block as an
+    // excursion. Target ownership is authoritative.
+    CausalTDPSOLARenderer::DiagnosticState committedStep;
+    for (int start = 0; start < block; start += block)
+    {
+        const auto ratio = std::exp2 (60.0 / 1200.0);
+        for (int sample = 0; sample < block; ++sample)
+        {
+            input[static_cast<size_t> (sample)] = static_cast<float> (0.3 * std::sin (phase));
+            phase += 2.0 * std::numbers::pi * sourceF0 / sampleRate;
+        }
+        renderer.process (input.data(), output.data(), block, sourceF0, ratio, true, false,
+                          sourceF0 * std::exp2 (1.0 / 12.0), 0.0, true, 1);
+        committedStep = renderer.getDiagnosticState();
+    }
+
+    const auto excursionPass = sawExcursionCursorDecision
+                            && excursionStep.trajectoryExcursionActive
+                            && excursionStep.strongRatioStep
+                            && ! excursionStep.targetCommitted
+                            && excursionStep.sourceCursorReanchorSuppressed
+                            && excursionStep.sourceCursorBeforeStrongStep
+                               == excursionStep.sourceCursorAfterStrongStep;
+    const auto commitPass = committedStep.strongRatioStep
+                         && committedStep.targetCommitted
+                         && ! committedStep.sourceCursorReanchorSuppressed;
+    std::cout << "renderer_excursion_cursor_isolation | excursion=" << excursionPass
+              << " target_commit=" << commitPass
+              << " excursion_active=" << excursionStep.trajectoryExcursionActive
+              << " excursion_strong=" << excursionStep.strongRatioStep
+              << " excursion_commit=" << excursionStep.targetCommitted
+              << " suppressed=" << excursionStep.sourceCursorReanchorSuppressed
+              << " cursor_before=" << excursionStep.sourceCursorBeforeStrongStep
+              << " cursor_after=" << excursionStep.sourceCursorAfterStrongStep << '\n';
+    return excursionPass && commitPass;
+}
 }
 
 int main()
@@ -195,6 +273,7 @@ int main()
     reportHarmonicProfile ("plus_30_cents", std::exp2 (30.0 / 1200.0));
     reportHarmonicProfileWithControlJitter();
     reportRapidReturnForensics();
+    const auto cursorIsolationPass = verifyTrajectoryExcursionCursorIsolation();
     for (const auto ratio : { 0.96, 1.0, 1.04 })
     {
         CausalTDPSOLARenderer renderer;
@@ -264,11 +343,15 @@ int main()
         renderer.prepare (sampleRate, block, 256);
         std::vector<float> all, in (block), out (block);
         all.reserve (static_cast<size_t> (sampleRate * 1.5));
-        auto phase = 0.0;
+        auto conformancePhase = 0.0;
         const auto ratio = std::exp2 (cents / 1200.0);
         for (int start = 0; start < static_cast<int> (sampleRate * 1.5); start += block)
         {
-            for (int i = 0; i < block; ++i) { in[i] = static_cast<float> (0.30 * std::sin (phase)); phase += 2.0 * std::numbers::pi * 220.0 / sampleRate; }
+            for (int i = 0; i < block; ++i)
+            {
+                in[static_cast<size_t> (i)] = static_cast<float> (0.30 * std::sin (conformancePhase));
+                conformancePhase += 2.0 * std::numbers::pi * 220.0 / sampleRate;
+            }
             renderer.process (in.data(), out.data(), block, 220.0, ratio, true);
             all.insert (all.end(), out.begin(), out.end());
         }
@@ -290,7 +373,11 @@ int main()
     {
         const auto segment = std::min (static_cast<int> (stepCents.size()) - 1, start / static_cast<int> (sampleRate * 0.5));
         const auto ratio = std::exp2 (stepCents[static_cast<size_t> (segment)] / 1200.0);
-        for (int i = 0; i < block; ++i) { stepIn[i] = static_cast<float> (0.30 * std::sin (stepPhase)); stepPhase += 2.0 * std::numbers::pi * 220.0 / sampleRate; }
+        for (int i = 0; i < block; ++i)
+        {
+            stepIn[static_cast<size_t> (i)] = static_cast<float> (0.30 * std::sin (stepPhase));
+            stepPhase += 2.0 * std::numbers::pi * 220.0 / sampleRate;
+        }
         stepRenderer.process (stepIn.data(), stepOut.data(), block, 220.0, ratio, true);
         stepStates[static_cast<size_t> (segment)] = stepRenderer.getDiagnosticState();
         stepArtifactVeto[static_cast<size_t> (segment)] = stepArtifactVeto[static_cast<size_t> (segment)]
@@ -322,7 +409,11 @@ int main()
     {
         const auto cents = start < 24000 ? 80.0 : -80.0;
         const auto ratio = std::exp2 (cents / 1200.0);
-        for (int i = 0; i < block; ++i) { resetIn[i] = static_cast<float> (0.30 * std::sin (resetPhase)); resetPhase += 2.0 * std::numbers::pi * 220.0 / sampleRate; }
+        for (int i = 0; i < block; ++i)
+        {
+            resetIn[static_cast<size_t> (i)] = static_cast<float> (0.30 * std::sin (resetPhase));
+            resetPhase += 2.0 * std::numbers::pi * 220.0 / sampleRate;
+        }
         resetRenderer.process (resetIn.data(), resetOut.data(), block, 220.0, ratio, true);
         // Ignore normal start-up priming: only a reversal-triggered reset or
         // dry hold would violate the continuity contract.
@@ -343,6 +434,7 @@ int main()
     std::cout << "renderer_reversal_continuity | reset=" << sawReset << " reentry=" << sawReentry
               << " measured_hz=" << afterResetF0 << " error_cents=" << afterResetError << '\n';
     conformancePass = conformancePass && ! sawReset && ! sawReentry && std::abs (afterResetError) < 25.0;
+    conformancePass = conformancePass && cursorIsolationPass;
     std::cout << "TD_PSOLA_RENDERER: " << (conformancePass ? "PASS" : "FAIL") << '\n';
     return conformancePass ? 0 : 1;
 }

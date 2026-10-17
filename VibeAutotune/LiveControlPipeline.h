@@ -50,6 +50,8 @@ public:
         trajectory.reset();
         last = {};
         haveTrajectory = false;
+        deliveredCorrectionCents = 0.0;
+        haveDeliveredCorrection = false;
     }
 
     int controlInterval() const noexcept { return controlIntervalSamples; }
@@ -85,11 +87,39 @@ public:
             return last;
         const auto data = trajectory.advanceScheduledTransition (controlIntervalSamples, sampleRate);
         last = fromTrajectory (data, last.stableF0Hz, last.voiced, false);
+        dezipperRendererControl (last);
         haveTrajectory = data.hasValidCorrection;
         return last;
     }
 
 private:
+    // Musical target selection remains untouched. This last handoff limiter
+    // prevents a newly published pitch-centre state becoming a grain-control
+    // discontinuity. 16 cents stays below a 1% ratio step per control tick.
+    static constexpr double maximumRendererCorrectionStepCents = 16.0;
+
+    void dezipperRendererControl (LiveControlFrame& frame) noexcept
+    {
+        if (! frame.valid || ! std::isfinite (frame.correctionCents))
+            return;
+
+        if (! haveDeliveredCorrection)
+        {
+            deliveredCorrectionCents = frame.correctionCents;
+            haveDeliveredCorrection = true;
+        }
+        else
+        {
+            const auto delta = std::clamp (frame.correctionCents - deliveredCorrectionCents,
+                                           -maximumRendererCorrectionStepCents,
+                                            maximumRendererCorrectionStepCents);
+            deliveredCorrectionCents += delta;
+        }
+
+        frame.correctionCents = deliveredCorrectionCents;
+        frame.pitchRatio = std::exp2 (deliveredCorrectionCents / 1200.0);
+    }
+
     static LiveControlFrame fromTrajectory (const CorrectionTrajectoryData& data,
                                             double stableF0Hz, bool voiced, bool transient) noexcept
     {
@@ -110,4 +140,6 @@ private:
     CorrectionTrajectory trajectory;
     LiveControlFrame last;
     bool haveTrajectory = false;
+    double deliveredCorrectionCents = 0.0;
+    bool haveDeliveredCorrection = false;
 };

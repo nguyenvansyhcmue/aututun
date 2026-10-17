@@ -20,6 +20,27 @@ constexpr bool isLegalNoteRule (NoteRule rule) noexcept
     return rule == NoteRule::Legal || rule == NoteRule::BypassLegal;
 }
 
+struct VocalTargetRange
+{
+    int firstMidi = 0;
+    int lastMidi = 127;
+};
+
+// This is a target-selection restriction, not a substitute for the separate
+// F0-analysis bandwidth.  The values intentionally match the four input
+// profiles used by the editor and pitch detector.
+constexpr VocalTargetRange vocalTargetRangeForInputType (int inputType) noexcept
+{
+    switch (inputType)
+    {
+        case 0:  return { 54, 83 }; // Soprano: F#3–B5
+        case 1:  return { 45, 77 }; // Alto:    A2–F5
+        case 2:  return { 40, 71 }; // Tenor:   E2–B4
+        case 3:  return { 33, 62 }; // Low:     A1–D4
+        default: return { 0, 127 };
+    }
+}
+
 // Presentation is deliberately a one-way mapping from the DSP state.  The
 // glyph is never parsed by the processor or used to choose a target note.
 constexpr const char* noteRuleGlyph (NoteRule rule) noexcept
@@ -37,6 +58,9 @@ constexpr const char* noteRuleGlyph (NoteRule rule) noexcept
 
 struct NotePolicySnapshot
 {
+    // A held MIDI note is an explicit monophonic target and takes precedence
+    // over automatic Key/Scale selection while it is active.
+    int midiTargetNote = -1;
     // The full twelve pitch classes are always present.  A MIDI override is
     // optional and wins over its pitch-class default; this keeps the UI,
     // persistence and DSP on the same note-map model.
@@ -44,6 +68,7 @@ struct NotePolicySnapshot
     std::array<NoteRule, 128> midiNoteOverrides {};
     std::array<bool, 128> hasMidiNoteOverride {};
     bool groupOctaves = true;
+    VocalTargetRange targetRange {};
 
     NoteRule ruleForMidi (int midiNote) const noexcept
     {
@@ -52,5 +77,11 @@ struct NotePolicySnapshot
         return hasMidiNoteOverride[static_cast<size_t> (midiNote)]
              ? midiNoteOverrides[static_cast<size_t> (midiNote)]
              : pitchClassDefaults[static_cast<size_t> (midiNote % 12)];
+    }
+
+    bool isLegalTarget (int midiNote) const noexcept
+    {
+        return midiNote >= targetRange.firstMidi && midiNote <= targetRange.lastMidi
+            && isLegalNoteRule (ruleForMidi (midiNote));
     }
 };

@@ -10,12 +10,12 @@ public:
     static void push (VibeAutotuneProcessor& processor, uint64_t timestamp,
                       double f0, double ratio, bool valid)
     {
-        processor.pushPsolaControlFrame (timestamp, f0, ratio, valid);
+        processor.pushPsolaControlFrame (timestamp, f0, ratio, 0.0, valid);
     }
 
     static auto at (const VibeAutotuneProcessor& processor, uint64_t timestamp)
     {
-        return processor.getSignalsmithControlFrame (timestamp);
+        return processor.getRendererControlFrame (timestamp);
     }
 };
 

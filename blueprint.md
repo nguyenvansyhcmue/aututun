@@ -11,7 +11,8 @@
    - Pitch Shifting: Implementation of PSOLA (Pitch Synchronous Overlap-Add) to preserve formants.
    - Scale Mapping: Quantize detected pitch to the nearest note in a selected musical scale.
 2. **UI & Control (Managed by GPT-5.6 Terra)**:
-   - Parameters: Retune Speed (ms), Scale/Key Selector, Correction Amount (0-100%).
+   - Parameters: Retune Speed (ms), Scale/Key Selector, Flex-Tune, Humanize,
+     Natural Vibrato, Tracking, Transpose, Reference Pitch and Voiced Colour.
    - Custom LookAndFeel for knobs and scale visualization.
 
 ## Development Workflow

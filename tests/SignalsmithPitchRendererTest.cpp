@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <numbers>
@@ -60,6 +61,42 @@ Result run (int blockSize, double sourceF0, double ratio)
     return { crossings * sampleRate / count, std::sqrt (energy / count), peak,
              totalUs / static_cast<double> (length / blockSize), worstUs, renderer.latencySamples(), finite };
 }
+
+bool runSibilanceGuard()
+{
+    constexpr int blockSize = 64;
+    SignalsmithPitchRenderer renderer;
+    renderer.prepare (sampleRate, blockSize);
+    std::vector<float> input (blockSize), output (blockSize);
+    auto finite = true;
+    auto peak = 0.0;
+    uint32_t noiseState = 0x13579bdfu;
+    const auto length = static_cast<int> (sampleRate * 2.0);
+    for (int start = 0; start < length; start += blockSize)
+    {
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const auto index = start + sample;
+            const auto vowel = 0.20 * std::sin (2.0 * std::numbers::pi * 220.0 * index / sampleRate);
+            noiseState = noiseState * 1664525u + 1013904223u;
+            const auto noise = (static_cast<double> ((noiseState >> 8) & 0xffffu) / 32767.5 - 1.0);
+            const auto isSibilant = index >= static_cast<int> (sampleRate * 0.75)
+                                && index < static_cast<int> (sampleRate * 0.95);
+            input[static_cast<size_t> (sample)] = static_cast<float> (vowel + (isSibilant ? noise * 0.30 : 0.0));
+        }
+        renderer.process (input.data(), output.data(), blockSize, std::exp2 (100.0 / 1200.0), true, 220.0);
+        for (const auto value : output)
+        {
+            finite = finite && std::isfinite (value);
+            peak = std::max (peak, std::abs (static_cast<double> (value)));
+        }
+    }
+    const auto engaged = renderer.getMaximumSibilanceResidualMix() > 0.05;
+    std::cout << "signalsmith_sibilance | engaged=" << engaged
+              << " max_mix=" << renderer.getMaximumSibilanceResidualMix()
+              << " peak=" << peak << " finite=" << finite << '\n';
+    return engaged && finite && peak < 1.0;
+}
 }
 
 int main()
@@ -86,6 +123,7 @@ int main()
                           << " peak=" << result.peak << " avg_us=" << result.averageUs
                           << " worst_us=" << result.worstUs << " finite=" << result.finite << '\n';
             }
+    passed = runSibilanceGuard() && passed;
     std::cout << "SIGNALSMITH_PITCH_RENDERER: " << (passed ? "PASS" : "FAIL") << '\n';
     return passed ? 0 : 1;
 }

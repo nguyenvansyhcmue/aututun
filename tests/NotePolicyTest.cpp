@@ -34,8 +34,8 @@ constexpr std::array<std::array<bool, 12>, 14> scaleIntervals {{
     {{ true, false, true, false, true, false, false, true, false, true, false, false }},
     {{ true, false, false, true, false, true, false, true, false, false, true, false }},
     {{ true, false, true, true, false, true, false, true, true, false, false, true }},
-    {{ true, false, true, true, false, true, false, true, true, false, true, false }},
-    {{ true, false, true, true, false, true, false, true, true, false, true, false }},
+    {{ true, false, true, true, false, true, false, true, false, true, false, true }}, // Melodic Minor ascending
+    {{ true, false, true, false, true, true, false, true, false, true, true, false }}, // Dorian
     {{ true, true, false, true, false, true, false, true, true, false, true, false }},
     {{ true, false, true, false, true, false, true, true, false, true, false, true }},
     {{ true, false, true, false, true, true, false, true, false, true, true, false }},
@@ -73,6 +73,8 @@ int main()
     VibeAutotuneProcessor processor;
     processor.prepareToPlay (48000.0, 64);
     auto* scaleParameter = processor.parameters.getParameter ("scale");
+    auto* keyParameter = processor.parameters.getParameter ("key");
+    keyParameter->setValueNotifyingHost (keyParameter->convertTo0to1 (0.0f)); // C
     scaleParameter->setValueNotifyingHost (scaleParameter->convertTo0to1 (1.0f)); // Major
     juce::AudioBuffer<float> syncBuffer (2, 64);
     juce::MidiBuffer midi;
@@ -85,7 +87,6 @@ int main()
     // The live processor must apply every Key/Scale selection to the policy
     // used by CorrectionTrajectory. The raw detected note is intentionally
     // not asserted here: it is independent from musical quantisation.
-    auto* keyParameter = processor.parameters.getParameter ("key");
     for (int key = 0; key < 12; ++key)
         for (int scale = 0; scale < static_cast<int> (scaleIntervals.size()); ++scale)
         {
@@ -200,5 +201,40 @@ int main()
     require (result.targetNote == 64 && std::abs (result.correctionCents) > 1.0,
              "BypassLegal was not usable as a legal landing target");
 
-    std::cout << "note_policy | C_major=pass G_major=pass nearest=pass up=pass down=pass bypass=pass overrides=pass persistence=pass\n";
+    // Range eligibility is part of policy resolution, not merely a dimming
+    // effect in the editor. An excluded B must be able to redirect across an
+    // octave to C, provided that C remains in the selected voice range.
+    auto ranged = cMajor();
+    ranged.targetRange = { 60, 72 };
+    ranged.pitchClassDefaults[11] = NoteRule::IllegalUp;
+    trajectory.reset();
+    result = settle (trajectory, 71, ranged);
+    require (result.targetNote == 72,
+             "IllegalUp did not find its legal target across an octave within range");
+
+    // Directional rules at a range boundary fail closed: they never wrap,
+    // retain a previous target, or reverse direction.
+    ranged.pitchClassDefaults[0] = NoteRule::IllegalDown;
+    trajectory.reset();
+    result = settle (trajectory, 60, ranged);
+    require (result.targetNote < 0 && ! result.hasValidCorrection,
+             "Range-boundary IllegalDown did not resolve to unity/dry");
+
+    // A completely empty legal set has the same deterministic safe fallback.
+    NotePolicySnapshot emptyPolicy;
+    emptyPolicy.targetRange = { 0, 127 };
+    for (auto& rule : emptyPolicy.pitchClassDefaults)
+        rule = NoteRule::IllegalNearest;
+    trajectory.reset();
+    result = settle (trajectory, 60, emptyPolicy);
+    require (result.targetNote < 0 && ! result.hasValidCorrection,
+             "Empty legal set did not resolve to unity/dry");
+
+    require (vocalTargetRangeForInputType (0).firstMidi == 54
+             && vocalTargetRangeForInputType (0).lastMidi == 83
+             && vocalTargetRangeForInputType (3).firstMidi == 33
+             && vocalTargetRangeForInputType (3).lastMidi == 62,
+             "Vocal target range mapping changed unexpectedly");
+
+    std::cout << "note_policy | C_major=pass G_major=pass nearest=pass up=pass down=pass bypass=pass overrides=pass persistence=pass range=pass empty=pass\n";
 }

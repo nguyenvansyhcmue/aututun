@@ -1,0 +1,26 @@
+---
+# Matches the existing JUCE-oriented C++ style. Keep this file at the root so
+# editor integrations and CI format the plug-in, tests and command-line tools
+# consistently without reordering deliberately grouped DSP includes.
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 120
+PointerAlignment: Left
+BreakBeforeBraces: Attach
+SortIncludes: Never
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+  AfterControlStatements: true
+  AfterForeachMacros: true
+  AfterFunctionDeclarationName: true
+  AfterFunctionDefinitionName: true
+  AfterIfMacros: true
+  AfterOverloadedOperator: false
+  BeforeNonEmptyParentheses: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+...

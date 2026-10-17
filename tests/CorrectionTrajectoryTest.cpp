@@ -13,7 +13,6 @@ namespace
 {
 constexpr double sampleRate = 48000.0;
 constexpr int analysisHop = 512;
-constexpr uint16_t chromaticMask = 0x0fff;
 
 NotePolicySnapshot policyFor (int key, int scale)
 {
@@ -37,9 +36,14 @@ struct Frame
 template <typename Contour>
 std::vector<Frame> runContour (int hostBlockSize, int totalSamples, double retuneMs, Contour&& contour,
                                double flexTunePercent = 0.0, double humanizePercent = 0.0,
-                               double naturalVibratoPercent = 0.0)
+                               double naturalVibratoPercent = 0.0,
+                               bool diagnosticContinuousRapidReturnExcursion = false,
+                               double diagnosticSlowRetuneInputReferenceAmountOverride = -1.0)
 {
     CorrectionTrajectory trajectory;
+    trajectory.setDiagnosticContinuousRapidReturnExcursion (diagnosticContinuousRapidReturnExcursion);
+    trajectory.setDiagnosticSlowRetuneInputReferenceAmountOverride (
+        diagnosticSlowRetuneInputReferenceAmountOverride);
     std::vector<Frame> frames;
     int nextAnalysis = analysisHop;
     for (int blockStart = 0; blockStart < totalSamples; blockStart += hostBlockSize)
@@ -60,25 +64,6 @@ std::vector<Frame> runContour (int hostBlockSize, int totalSamples, double retun
         }
     }
     return frames;
-}
-
-double transition1090Ms (const std::vector<Frame>& frames, int startSample,
-                         double fromCents, double toCents)
-{
-    const auto direction = toCents > fromCents ? 1.0 : -1.0;
-    auto time10 = std::numeric_limits<double>::quiet_NaN();
-    for (const auto& frame : frames)
-    {
-        if (frame.sample < startSample || ! frame.data.hasValidCorrection)
-            continue;
-        const auto progress = direction * (frame.data.transitionTargetCents - fromCents)
-                            / std::abs (toCents - fromCents);
-        if (! std::isfinite (time10) && progress >= 0.10)
-            time10 = frame.sample;
-        if (std::isfinite (time10) && progress >= 0.90)
-            return (frame.sample - time10) * 1000.0 / sampleRate;
-    }
-    return std::numeric_limits<double>::quiet_NaN();
 }
 
 struct ContourPoint
@@ -194,6 +179,19 @@ double meanCorrectedPitch (const std::vector<Frame>& frames, int firstSample)
     return count > 0 ? sum / static_cast<double> (count) : std::numeric_limits<double>::quiet_NaN();
 }
 
+double meanVibratoEnergy (const std::vector<Frame>& frames, int firstSample)
+{
+    auto sum = 0.0;
+    auto count = 0;
+    for (const auto& frame : frames)
+        if (frame.sample >= firstSample && frame.data.hasValidCorrection)
+        {
+            sum += frame.data.vibratoEnergyCents;
+            ++count;
+        }
+    return count > 0 ? sum / static_cast<double> (count) : std::numeric_limits<double>::quiet_NaN();
+}
+
 void require (bool condition, const char* message)
 {
     if (! condition)
@@ -206,25 +204,62 @@ void require (bool condition, const char* message)
 
 int main()
 {
+    // The decomposer is analysis-only. Verify its periodicity classification
+    // independently so future Humanize/Natural routing cannot silently turn
+    // ordinary drift into vibrato or vice versa.
+    {
+        PitchDecomposer decomposer;
+        PitchComponents flat;
+        PitchComponents periodic;
+        for (int frame = 0; frame < 140; ++frame)
+        {
+            const auto seconds = static_cast<double> (frame * analysisHop) / sampleRate;
+            flat = decomposer.process (0.0, 220.0, sampleRate, analysisHop, 0.250);
+            (void) seconds;
+        }
+        require (std::abs (flat.residualCents) < 1.0e-12 && flat.vibratoConfidence < 1.0e-12,
+                 "flat pitch was classified as vibrato");
+
+        decomposer.reset();
+        for (int frame = 0; frame < 140; ++frame)
+        {
+            const auto seconds = static_cast<double> (frame * analysisHop) / sampleRate;
+            periodic = decomposer.process (20.0 * std::sin (2.0 * std::numbers::pi * 5.0 * seconds),
+                                            220.0, sampleRate, analysisHop, 0.250);
+        }
+        std::cout << "pitch_decomposition | rate_hz=" << periodic.vibratoRateHz
+                  << " confidence=" << periodic.vibratoConfidence
+                  << " stability=" << periodic.noteStability << '\n';
+        require (periodic.periodicVibrato && periodic.vibratoConfidence > 0.7,
+                 "periodic vibrato was not recognised");
+    }
+
     std::cout << std::fixed << std::setprecision (3);
-    require (CorrectionTrajectory::getEffectiveRetuneTimeMs (0.0) == 0.0,
+    CorrectionTrajectory retuneLaw;
+    require (retuneLaw.getEffectiveRetuneTimeMs (0.0) == 0.0,
              "0 ms must remain a hard-tune snap");
-    require (CorrectionTrajectory::getEffectiveRetuneTimeMs (0.1) >= 8.0,
+    require (retuneLaw.getEffectiveRetuneTimeMs (0.1) >= 8.0,
              "every non-zero retune setting must remain continuous");
-    require (std::abs (CorrectionTrajectory::getEffectiveRetuneTimeMs (10.0) - 23.162) < 0.01,
-             "10 ms must use the measured Artist time constant");
-    require (std::abs (CorrectionTrajectory::getEffectiveRetuneTimeMs (25.0) - 41.686) < 0.01,
-             "25 ms must use the measured Artist time constant");
-    require (std::abs (CorrectionTrajectory::getEffectiveRetuneTimeMs (50.0) - 76.436) < 0.01,
+    // The Hook-2 calibrated control profile uses the verified 20/40 ms T90
+    // knots here. Keep this test coupled to that production contract rather
+    // than to the older pre-calibration fixture.
+    require (std::abs (retuneLaw.getEffectiveRetuneTimeMs (10.0) - (20.0 / 2.302585092994046)) < 0.01,
+             "10 ms must use the calibrated Hook-2 Artist time constant");
+    require (std::abs (retuneLaw.getEffectiveRetuneTimeMs (25.0) - (40.0 / 2.302585092994046)) < 0.01,
+             "25 ms must use the calibrated Hook-2 Artist time constant");
+    require (std::abs (retuneLaw.getEffectiveRetuneTimeMs (50.0) - 76.436) < 0.01,
              "50 ms must use the measured Artist time constant");
-    require (CorrectionTrajectory::getEffectiveRetuneTimeMs (100.0) > 140.0,
-             "settings above the measured range must continue the Artist-calibrated slope");
+    constexpr auto ln10 = 2.302585092994046;
+    require (std::abs (retuneLaw.getEffectiveRetuneTimeMs (300.0) * ln10 - 300.0) < 0.01,
+             "300 ms must reach 90 percent correction in 300 ms");
+    require (std::abs (retuneLaw.getEffectiveRetuneTimeMs (400.0) * ln10 - 400.0) < 0.01,
+             "400 ms must reach 90 percent correction in 400 ms");
     require (CorrectionTrajectory::getNoteTransitionDurationMs (TuningPolicy::Standard, 400.0)
                  > CorrectionTrajectory::getNoteTransitionDurationMs (TuningPolicy::Standard, 100.0),
              "note transitions must soften with the extended retune range");
     const auto staticOffset = [] (int) { return ContourPoint { 50.0, true }; };
 
-    for (const auto retuneMs : { 0.0, 20.0, 50.0, 100.0, 400.0 })
+    for (const auto retuneMs : { 0.0, 20.0, 50.0, 100.0, 300.0, 400.0 })
     {
         const auto frames = runContour (64, 48000, retuneMs, staticOffset);
         const auto time63 = millisecondsForProgress (frames, 50.0, 0.63);
@@ -237,7 +272,10 @@ int main()
         require (hasOnlyFiniteValidOutputs (frames), "static trajectory produced NaN");
         if (retuneMs == 0.0)
             require (time99 <= 4.0 * static_cast<double> (analysisHop) * 1000.0 / sampleRate,
-                     "0 ms hard-lock guard did not settle");
+                    "0 ms hard-lock guard did not settle");
+        if (retuneMs >= 300.0)
+            require (std::abs (time90 - retuneMs) <= 2.0 * analysisHop * 1000.0 / sampleRate,
+                     "high Retune did not meet its displayed 90-percent correction time");
     }
 
     // A one-frame note candidate must not move the target. The three-frame
@@ -390,7 +428,8 @@ int main()
     std::cout << "humanize_centred_vibrato | base_mean=" << centredBaseMean
               << " human_mean=" << centredHumanMean
               << " base_depth=" << centredBaseDepth
-              << " human_depth=" << centredHumanDepth << '\n';
+              << " human_depth=" << centredHumanDepth
+              << " analysed_energy=" << meanVibratoEnergy (centredHuman, 48000) << '\n';
     require (std::abs (centredBaseMean) < 2.0 && std::abs (centredHumanMean) < 2.0,
              "Humanize drifted a centred vibrato");
     require (centredHumanDepth >= centredBaseDepth * 0.75,
@@ -416,7 +455,8 @@ int main()
     };
     const auto wideHuman = runContour (64, 96000, 10.0, wideVibrato, 0.0, 100.0);
     std::cout << "humanize_wide_vibrato | target_switches=" << targetSwitchCount (wideHuman)
-              << " output_depth=" << centredOutputPeak (wideHuman, 48000) << '\n';
+              << " output_depth=" << centredOutputPeak (wideHuman, 48000)
+              << " analysed_energy=" << meanVibratoEnergy (wideHuman, 48000) << '\n';
     require (targetSwitchCount (wideHuman) == 0, "wide vibrato caused a Humanize target switch");
 
     // Slow non-periodic drift has no 4-8 Hz signature. Humanize therefore
@@ -469,6 +509,60 @@ int main()
     for (const auto& frame : voicedUnvoicedFrames)
         if (frame.sample >= 10240 && frame.sample < 15872)
             require (! frame.data.hasValidCorrection, "unvoiced frame published a correction");
+
+    // This candidate is calibrated only for the hard-lock reference tuple.
+    // Its offline switch must leave all four controls untouched elsewhere.
+    const auto fourKnobBaseline = runContour (64, 30000, 20.0, vibrato, 50.0, 75.0, 12.0);
+    const auto fourKnobDiagnostic = runContour (64, 30000, 20.0, vibrato,
+                                                50.0, 75.0, 12.0, true);
+    const auto fourKnobDifference = maximumBlockDifference (fourKnobBaseline, fourKnobDiagnostic);
+    std::cout << "rapid_return_four_knob_isolation | max_cents_difference="
+              << fourKnobDifference << '\n';
+    require (fourKnobDifference == 0.0,
+             "rapid-return diagnostic changed a non-hard-lock four-knob trajectory");
+
+    const auto shortSourceMovement = [] (int sample)
+    {
+        return ContourPoint { sample < 12000 ? 20.0 : 40.0, true };
+    };
+    const auto slowRetuneProduction = runContour (64, 24000, 300.0, shortSourceMovement);
+    const auto slowRetuneReferenceDisabled = runContour (64, 24000, 300.0, shortSourceMovement,
+                                                         0.0, 0.0, 0.0, false, 0.0);
+    const auto slowReferenceDifference = maximumBlockDifference (slowRetuneReferenceDisabled,
+                                                                 slowRetuneProduction);
+    std::cout << "slow_retune_input_reference | max_cents_difference="
+              << slowReferenceDifference << '\n';
+    require (slowReferenceDifference > 1.0,
+             "production slow-Retune input reference did not alter its calibrated tuple");
+    require (hasOnlyFiniteValidOutputs (slowRetuneProduction),
+             "production slow-Retune input reference produced a non-finite value");
+
+    struct InteractionSetting
+    {
+        const char* name;
+        double flex;
+        double humanize;
+        double naturalVibrato;
+    };
+    constexpr std::array<InteractionSetting, 4> interactionSettings {{
+        { "flex", 50.0, 0.0, 0.0 },
+        { "humanize", 0.0, 75.0, 0.0 },
+        { "natural_vibrato", 0.0, 0.0, 12.0 },
+        { "all", 50.0, 75.0, 12.0 },
+    }};
+    for (const auto& setting : interactionSettings)
+    {
+        const auto production = runContour (64, 24000, 300.0, shortSourceMovement,
+                                            setting.flex, setting.humanize, setting.naturalVibrato);
+        const auto referenceDisabled = runContour (64, 24000, 300.0, shortSourceMovement,
+                                                   setting.flex, setting.humanize,
+                                                   setting.naturalVibrato, false, 0.0);
+        const auto difference = maximumBlockDifference (production, referenceDisabled);
+        std::cout << "slow_retune_four_knob_isolation | active_control=" << setting.name
+                  << " max_cents_difference=" << difference << '\n';
+        require (difference == 0.0,
+                 "slow-Retune production law leaked into an unverified four-knob tuple");
+    }
 
     const auto reference = runContour (64, 30000, 50.0, semitone);
     for (const auto blockSize : { 64, 128, 256, 512, 1024 })
